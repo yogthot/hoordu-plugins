@@ -113,7 +113,7 @@ class Twitter(object):
         elif access_token_key is None or access_token_secret is None:
             pin = None
             if parameters is not None:
-                pin = parameters.get('pin')
+                pin = parameters.get('user_input')
             
             if pin is None:
                 oauth_token, oauth_token_secret, url = oauth_start(consumer_key, consumer_secret)
@@ -226,7 +226,9 @@ class Twitter(object):
         
         Returns True if this plugin is able to download the url.
         """
-        return bool(TWEET_REGEXP.match(url))
+        is_valid_url = bool(TWEET_REGEXP.match(url))
+        is_digit = url.isdigit()
+        return is_valid_url or is_digit
     
     def _download_file(self, url):
         self.log.debug('downloading %s', url)
