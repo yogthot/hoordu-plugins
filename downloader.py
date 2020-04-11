@@ -36,40 +36,31 @@ def fail(format, *args, **kwargs):
     sys.exit(1)
 
 
-# this should be the general approach to initialization
-def init(manager, Api, conf):
-    # attempt to init
-    success, api = Api.init(manager, parameters=conf)
-    
-    if success:
-        # if the config is complete then the api is ready to use
-        return api
-    
-    elif api is not None:
-        # if not successful but something else was returned
-        # then attempt to ask the user for input
+# this should be the general approach to initialization of an api
+def init(manager, Api, parameters):
+    while True:
+        # attempt to init
+        success, api = Api.init(manager, parameters=parameters)
         
-        # this would normally be done via a form
-        # but in this case we know we need to print the url and ask for a pin
-        url = api
+        if success:
+            manager.commit()
+            return api
         
-        print('please visit the following url in your browser, log into Twitter and copy the pin into the terminal.')
-        print(url)
-        pin = input('Pin: ')
+        elif api is not None:
+            # if not successful but something else was returned
+            # then attempt to ask the user for input
+            
+            # TODO simple forms
+            prompt = api
+            
+            user_input = input('{}: '.format(prompt))
+            
+            # update parameters and try again
+            parameters = {'user_input': user_input}
         
-        # try to init again, but this time with the additional information
-        # the form should somehow return a result that would be passed back to Api.init
-        success, api = Api.init(session, parameters={'pin': pin})
-        
-        if not success:
+        else:
             print('something went wrong with the authentication')
-            import sys
             sys.exit(1)
-        
-        # everything was successful, let's commit to make sure the config is saved
-        session.commit()
-        
-        return api
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
@@ -153,6 +144,9 @@ if __name__ == '__main__':
             
             manager.session.query(Subscription).filter(Subscription.service_id == api.service.id, Subscription.name == sub_name).delete()
             manager.commit()
+        
+    except SystemExit:
+        pass
         
     except:
         traceback.print_exc()
