@@ -119,10 +119,15 @@ if __name__ == '__main__':
             else:
                 fail('subscription named \'{0}\' doesn\'t exist', sub_name)
             
+        elif command == 'list':
+            subs = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id)
+            for sub in subs:
+                print('\'{0}\': {1}'.format(sub.name, sub.options))
+            
         elif command == 'update-all':
             subs = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id)
             for sub in subs:
-                print('getting all new posts for subscription \'{0}\''.format(sub_name))
+                print('getting all new posts for subscription \'{0}\''.format(sub.name))
                 api.update_subscription(sub)
                 manager.commit()
             
