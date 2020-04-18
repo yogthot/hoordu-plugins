@@ -6,7 +6,7 @@ import importlib.util
 import traceback
 
 import hoordu
-from hoordu.models import Service, Subscription
+from hoordu.models import Source, Subscription
 
 def load_module(filename):
     module_name = Path(filename).name.split('.')[0]
@@ -36,22 +36,22 @@ def fail(format, *args, **kwargs):
     sys.exit(1)
 
 
-# this should be the general approach to initialization of an api
-def init(manager, Api, parameters):
+# this should be the general approach to initialization of a plugin
+def init(hrd, Plugin, parameters):
     while True:
         # attempt to init
-        success, api = Api.init(manager, parameters=parameters)
+        success, plugin = hrd.init_plugin(Plugin, parameters=parameters)
         
         if success:
-            manager.commit()
-            return api
+            hrd.core.commit()
+            return plugin
         
-        elif api is not None:
+        elif plugin is not None:
             # if not successful but something else was returned
             # then attempt to ask the user for input
             
             # TODO simple forms
-            prompt = api
+            prompt = plugin
             
             user_input = input('{}: '.format(prompt))
             
@@ -75,22 +75,23 @@ if __name__ == '__main__':
     hrd = hoordu.hoordu(config)
     
     plugin_config = hoordu.load_config('{0}/{0}.conf'.format(plugin_name))
-    plugin = load_module('{0}/{0}.py'.format(plugin_name)).plugin
+    Plugin = load_module('{0}/{0}.py'.format(plugin_name)).Plugin
     
-    manager = hrd.get_manager(plugin_name)
-    api = init(manager, plugin, plugin_config)
+    plugin = init(hrd, Plugin, plugin_config)
     # this property is supposed to make the plugin implementation commit
     # after every post is imported, rather than leaving it to the caller
     # temporary until I find a better way to configure plugins
-    api.autocommit = True
+    plugin.autocommit = True
+    
+    core = plugin.core
     
     try:
         if command == 'download':
             url = args[0]
             
-            if api.can_download(url):
-                api.download(url, preview=False)
-                manager.commit()
+            if plugin.can_download(url):
+                plugin.download(url, preview=False)
+                core.commit()
             else:
                 fail('can\'t download the given url: {0}', url)
             
@@ -98,11 +99,11 @@ if __name__ == '__main__':
             sub_name = args[0]
             sub_search = args[1]
             
-            sub = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id, Subscription.name == sub_name).one_or_none()
+            sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is None:
                 print('creating subscription \'{0}\' with search \'{1}\''.format(sub_name, sub_search))
-                sub = api.create_subscription(sub_name, sub_search)
-                manager.commit()
+                sub = plugin.create_subscription(sub_name, sub_search)
+                core.commit()
                 
             else:
                 fail('subscription named \'{0}\' already exists', sub_name)
@@ -110,36 +111,36 @@ if __name__ == '__main__':
         elif command == 'update':
             sub_name = args[0]
             
-            sub = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id, Subscription.name == sub_name).one_or_none()
+            sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is not None:
                 print('getting all new posts for subscription \'{0}\''.format(sub_name))
-                api.update_subscription(sub)
-                manager.commit()
+                plugin.update_subscription(sub)
+                core.commit()
                 
             else:
                 fail('subscription named \'{0}\' doesn\'t exist', sub_name)
             
         elif command == 'list':
-            subs = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id)
+            subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
             for sub in subs:
                 print('\'{0}\': {1}'.format(sub.name, sub.options))
             
         elif command == 'update-all':
-            subs = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id)
+            subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
             for sub in subs:
                 print('getting all new posts for subscription \'{0}\''.format(sub.name))
-                api.update_subscription(sub)
-                manager.commit()
+                plugin.update_subscription(sub)
+                core.commit()
             
         elif command == 'fetch':
             sub_name = args[0]
             num_posts = int(args[1])
             
-            sub = manager.session.query(Subscription).filter(Subscription.service_id == api.service.id, Subscription.name == sub_name).one_or_none()
+            sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is not None:
                 print('fetching {0} posts for subscription \'{1}\''.format(num_posts, sub_name))
-                api.fetch_subscription(sub, num_posts)
-                manager.commit()
+                plugin.fetch_subscription(sub, num_posts)
+                core.commit()
                 
             else:
                 fail('subscription named \'{0}\' doesn\'t exist', sub_name)
@@ -147,8 +148,8 @@ if __name__ == '__main__':
         elif command == 'unsub':
             sub_name = args[0]
             
-            manager.session.query(Subscription).filter(Subscription.service_id == api.service.id, Subscription.name == sub_name).delete()
-            manager.commit()
+            core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).delete()
+            core.commit()
         
     except SystemExit:
         pass
@@ -156,7 +157,7 @@ if __name__ == '__main__':
     except:
         traceback.print_exc()
         # rollback whatever was being done at the time
-        manager.rollback()
+        core.rollback()
         sys.exit(1)
 
 

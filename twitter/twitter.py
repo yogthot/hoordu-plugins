@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# these variables don't really need to be defined like this
-__title__ = 'twitter'
-__version__ = 1
 
 CONSUMER_KEY = None
 CONSUMER_SECRET = None
@@ -23,7 +20,7 @@ from urllib.parse import urlparse
 import urllib3
 http = urllib3.PoolManager()
 
-from hoordu.models import RemotePost, PostType, RemoteTag, TagCategory, File, Subscription, ServiceSetupState
+from hoordu.models import RemotePost, PostType, RemoteTag, TagCategory, File, Subscription, SourceSetupState
 from requests_oauthlib import OAuth1Session
 import twitter
 
@@ -64,14 +61,17 @@ def oauth_finish(consumer_key, consumer_secret, oauth_token, oauth_token_secret,
 
 
 class Twitter(object):
+    name = 'twitter'
+    version = 1
+    
     @classmethod
-    def init(cls, manager, parameters=None):
-        service = manager.register_service(__title__)
+    def init(cls, core, parameters=None):
+        source = core.register_source(cls.name)
         
-        cls.update(manager, service)
+        cls.update(core, source)
         
         # check if everything is ready to use
-        config = json.loads(service.config)
+        config = json.loads(source.config)
         consumer_key = config.get('consumer_key', CONSUMER_KEY)
         consumer_secret = config.get('consumer_secret', CONSUMER_SECRET)
         
@@ -98,15 +98,15 @@ class Twitter(object):
                 
                 config['sub_preview'] = parameters.get('sub_preview', None)
                 
-                service.config = json.dumps(config)
-                manager.add(service)
+                source.config = json.dumps(config)
+                core.add(source)
         
         
         if consumer_key is None or consumer_secret is None:
             # but if they're still None, the api can't be used
-            service.setup_state = ServiceSetupState.config
-            manager.add(service)
-            #manager.commit()
+            source.setup_state = SourceSetupState.config
+            core.add(source)
+            #core.commit()
             # request the values to be sent into parameters
             return False, None
         
@@ -120,9 +120,9 @@ class Twitter(object):
                 
                 config['oauth_token'] = oauth_token
                 config['oauth_token_secret'] = oauth_token_secret
-                service.setup_state = ServiceSetupState.setup
-                service.config = json.dumps(config)
-                manager.add(service)
+                source.setup_state = SourceSetupState.setup
+                source.config = json.dumps(config)
+                core.add(source)
                 
                 return False, url
                 
@@ -137,41 +137,41 @@ class Twitter(object):
                     
                 config['access_token_key'] = access_token_key
                 config['access_token_secret'] = access_token_secret
-                service.setup_state = ServiceSetupState.ready
-                service.config = json.dumps(config)
-                manager.add(service)
+                source.setup_state = SourceSetupState.ready
+                source.config = json.dumps(config)
+                core.add(source)
                 
-                return True, cls(manager, service)
+                return True, cls(core, source)
             
         else:
             # everything should be fine
-            return True, cls(manager, service)
+            return True, cls(core, source)
     
     @classmethod
-    def update(cls, manager, service):
-        if service.config is None:
-            service.config = '{}'
-            manager.add(service)
+    def update(cls, core, source):
+        if source.config is None:
+            source.config = '{}'
+            core.add(source)
         
-        if service.version < __version__:
+        if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
-            service.version = __version__
-            manager.add(service)
+            source.version = cls.version
+            core.add(source)
     
-    def __init__(self, manager, service, config=None):
-        self.manager = manager
-        self.service = service
-        self.log = manager.logger
-        self.session = manager.session
+    def __init__(self, core, source, config=None):
+        self.core = core
+        self.source = source
+        self.log = core.logger
+        self.session = core.session
         
         self.autocommit = False
         
         if config is not None:
             self._load_config(config)
         else:
-            self._load_config(json.loads(service.config))
+            self._load_config(json.loads(source.config))
         
         self._init_api()
     
@@ -292,26 +292,29 @@ class Twitter(object):
         
         self.log.info('downloading tweet %s', remote_id)
         
-        post = self.session.query(RemotePost).filter(RemotePost.service_id == self.service.id, RemotePost.remote_id == remote_id).one_or_none()
+        post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.remote_id == remote_id).one_or_none()
         if post is None:
             self.log.info('creating new post')
             post = RemotePost(
-                service=self.service,
+                source=self.source,
                 remote_id=remote_id,
                 comment=text,
-                type=PostType.pool,
+                type=PostType.set,
                 post_time=post_time,
                 metadata_=json.dumps({'user': user})
             )
             
-            user_tag = self.manager.get_remote_tag(service=self.service, category=TagCategory.artist, tag=user)
+            user_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.artist, tag=user)
             post.tags.append(user_tag)
             
+            if tweet.favorited is True:
+                post.favorite = True
+            
             if tweet.possibly_sensitive:
-                nsfw_tag = self.manager.get_remote_tag(service=self.service, category=TagCategory.meta, tag='nsfw')
+                nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.meta, tag='nsfw')
                 post.tags.append(nsfw_tag)
             
-            self.manager.add(post)
+            self.core.add(post)
             
         else:
             self.log.info('post already exists: %s', post.id)
@@ -322,8 +325,8 @@ class Twitter(object):
             
             for order in available - present:
                 file = File(remote=post, remote_order=order)
-                self.manager.add(file)
-                self.manager.flush()
+                self.core.add(file)
+                self.core.flush()
                 self.log.info('found new file for post %s, file order: %s', post.id, order)
             
             for file in post.files:
@@ -333,7 +336,7 @@ class Twitter(object):
                 if need_thumb or need_file:
                     self.log.info('downloading files for post: %s, file: %r, thumb: %r', post.id, need_file, need_thumb)
                     thumb, orig = self._download_media(tweet.media[file.remote_order], thumbnail=need_thumb, file=need_file)
-                    self.manager.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
         
         return post
     
@@ -370,7 +373,7 @@ class Twitter(object):
     def create_subscription(self, name, search):
         """
         Creates a Subscription entry for a given search identified by the given name,
-        should not get any posts from the service.
+        should not get any posts from the post source.
         """
         
         method, user = search.split(':')
@@ -386,14 +389,14 @@ class Twitter(object):
         initial_state = {}
         
         sub = Subscription(
-            service=self.service,
+            source=self.source,
             name=name,
             options=json.dumps(search_options),
             state=json.dumps(initial_state)
         )
         
-        self.manager.add(sub)
-        self.manager.flush()
+        self.core.add(sub)
+        self.core.flush()
         
         return sub
     
@@ -486,7 +489,7 @@ class Twitter(object):
             subscription.feed.append(post)
             
             if self.autocommit:
-                self.manager.commit()
+                self.core.commit()
             
             tail_id = tweet.id_str
         
@@ -497,7 +500,7 @@ class Twitter(object):
             state['tail_id'] = tail_id
         
         subscription.state = json.dumps(state)
-        self.manager.add(subscription)
+        self.core.add(subscription)
         
         return posts
     
@@ -527,7 +530,7 @@ class Twitter(object):
             subscription.feed.append(post)
             
             if self.autocommit:
-                self.manager.commit()
+                self.core.commit()
             
             tail_id = tweet.id_str
         
@@ -537,9 +540,9 @@ class Twitter(object):
         state['tail_id'] = tail_id
         subscription.state = json.dumps(state)
         
-        self.manager.add(subscription)
+        self.core.add(subscription)
         
         return posts
 
 
-plugin = Twitter
+Plugin = Twitter
