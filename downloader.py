@@ -7,6 +7,7 @@ import traceback
 
 import hoordu
 from hoordu.models import Source, Subscription
+from hoordu.plugins import FetchDirection
 
 def load_module(filename):
     module_name = Path(filename).name.split('.')[0]
@@ -78,10 +79,6 @@ if __name__ == '__main__':
     Plugin = load_module('{0}/{0}.py'.format(plugin_name)).Plugin
     
     plugin = init(hrd, Plugin, plugin_config)
-    # this property is supposed to make the plugin implementation commit
-    # after every post is imported, rather than leaving it to the caller
-    # temporary until I find a better way to configure plugins
-    plugin.autocommit = True
     
     core = plugin.core
     
@@ -114,7 +111,8 @@ if __name__ == '__main__':
             sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is not None:
                 print('getting all new posts for subscription \'{0}\''.format(sub_name))
-                plugin.update_subscription(sub)
+                it = plugin.get_iterator(sub)
+                it.fetch(direction=FetchDirection.newer, n=None)
                 core.commit()
                 
             else:
@@ -129,7 +127,8 @@ if __name__ == '__main__':
             subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
             for sub in subs:
                 print('getting all new posts for subscription \'{0}\''.format(sub.name))
-                plugin.update_subscription(sub)
+                it = plugin.get_iterator(sub)
+                it.fetch(direction=FetchDirection.newer, n=None)
                 core.commit()
             
         elif command == 'fetch':
@@ -139,7 +138,8 @@ if __name__ == '__main__':
             sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is not None:
                 print('fetching {0} posts for subscription \'{1}\''.format(num_posts, sub_name))
-                plugin.fetch_subscription(sub, num_posts)
+                it = plugin.get_iterator(sub)
+                it.fetch(direction=FetchDirection.older, n=num_posts)
                 core.commit()
                 
             else:
