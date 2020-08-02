@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import urllib3
 http = urllib3.PoolManager()
 
-from hoordu.models import RemotePost, PostType, RemoteTag, TagCategory, File, Subscription, SourceSetupState
+from hoordu.models import RemotePost, PostType, RemoteTag, TagCategory, File, Subscription, SourceSetupState, Related
 from hoordu.plugins import FetchDirection
 
 from requests_oauthlib import OAuth1Session
@@ -321,7 +321,8 @@ class Twitter(object):
             consumer_key=self.consumer_key,
             consumer_secret=self.consumer_secret,
             access_token_key=self.access_token_key,
-            access_token_secret=self.access_token_secret)
+            access_token_secret=self.access_token_secret,
+            tweet_mode='extended')
         
         credentials = self.api.VerifyCredentials()
         
@@ -341,13 +342,13 @@ class Twitter(object):
         """
         Gets the url for a RemotePost.
         This function should the stored information to generate the url.
-        If the remote_id is not enough, any extra data (or even the url itself),
+        If the original_id is not enough, any extra data (or even the url itself),
         should be stored in the metadata field.
         If no url can be generated, then None should be returned.
         """
         
         metadata = json.loads(remote_post.metadata_)
-        return TWEET_FORMAT.format(user=metadata.get('user', '_'), tweet_id=remote_post.remote_id)
+        return TWEET_FORMAT.format(user=metadata.get('user', '_'), tweet_id=remote_post.original_id)
     
     def can_download(self, url):
         """
@@ -416,19 +417,19 @@ class Twitter(object):
         if tweet.retweeted_status is not None:
             tweet = tweet.retweeted_status
         
-        remote_id = tweet.id_str
+        original_id = tweet.id_str
         user = tweet.user.screen_name
         text = tweet.full_text
         post_time = datetime.utcfromtimestamp(tweet.created_at_in_seconds)
         
-        self.log.info('getting tweet %s', remote_id)
+        self.log.info('getting tweet %s', original_id)
         
-        post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.remote_id == remote_id).one_or_none()
+        post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
         if post is None:
             self.log.info('creating new post')
             post = RemotePost(
                 source=self.source,
-                remote_id=remote_id,
+                original_id=original_id,
                 comment=text,
                 type=PostType.set,
                 post_time=post_time,
@@ -444,6 +445,24 @@ class Twitter(object):
             if tweet.possibly_sensitive:
                 nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.meta, tag='nsfw')
                 post.tags.append(nsfw_tag)
+            
+            if tweet.hashtags is not None:
+                for hashtag in tweet.hashtags:
+                    tag = hashtag.text
+                    nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.general, tag=tag)
+                    post.tags.append(nsfw_tag)
+            
+            if tweet.in_reply_to_status_id is not None:
+                url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
+                post.related.append(Related(url=url))
+            
+            if tweet.urls is not None:
+                for url in tweet.urls:
+                    # the unwound section is a premium feature
+                    url = url.url
+                    self.log.info('found url %s', url)
+                    final_url = http.request('HEAD', url).geturl()
+                    post.related.append(Related(url=final_url))
             
             self.core.add(post)
             

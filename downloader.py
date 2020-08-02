@@ -87,8 +87,12 @@ if __name__ == '__main__':
             url = args[0]
             
             if plugin.can_download(url):
-                plugin.download(url, preview=False)
+                remote_post = plugin.download(url, preview=False)
                 core.commit()
+                
+                print('related urls:')
+                for related in remote_post.related:
+                    print('    {}'.format(related.url))
             else:
                 fail('can\'t download the given url: {0}', url)
             
@@ -126,10 +130,13 @@ if __name__ == '__main__':
         elif command == 'update-all':
             subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
             for sub in subs:
-                print('getting all new posts for subscription \'{0}\''.format(sub.name))
-                it = plugin.get_iterator(sub)
-                it.fetch(direction=FetchDirection.newer, n=None)
-                core.commit()
+                try:
+                    print('getting all new posts for subscription \'{0}\''.format(sub.name))
+                    it = plugin.get_iterator(sub)
+                    it.fetch(direction=FetchDirection.newer, n=None)
+                    core.commit()
+                except:
+                    traceback.print_exc()
             
         elif command == 'fetch':
             sub_name = args[0]
