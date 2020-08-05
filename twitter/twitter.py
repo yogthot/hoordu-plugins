@@ -60,6 +60,21 @@ def oauth_finish(consumer_key, consumer_secret, oauth_token, oauth_token_secret,
     
     return access_token_key, access_token_secret
 
+def unwind_url(url):
+    final_url = url
+    try:
+        while url is not None:
+            resp = http.request('HEAD', url, redirect=False)
+            if resp.status // 100 == 3:
+                url = resp.headers.get('Location')
+                if url is not None:
+                    final_url = url
+            else:
+                url = None
+    except:
+        pass
+    
+    return final_url
 
 class TweetIterator(object):
     def __init__(self, twitter, subscription=None, options=None):
@@ -459,9 +474,8 @@ class Twitter(object):
             if tweet.urls is not None:
                 for url in tweet.urls:
                     # the unwound section is a premium feature
-                    url = url.url
-                    self.log.info('found url %s', url)
-                    final_url = http.request('HEAD', url).geturl()
+                    self.log.info('found url %s', url.url)
+                    final_url = unwind_url(url.url)
                     post.related.append(Related(url=final_url))
             
             self.core.add(post)

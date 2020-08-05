@@ -137,6 +137,7 @@ if __name__ == '__main__':
                     core.commit()
                 except:
                     traceback.print_exc()
+                    core.rollback()
             
         elif command == 'fetch':
             sub_name = args[0]
