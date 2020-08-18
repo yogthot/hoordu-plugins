@@ -44,7 +44,7 @@ def init(hrd, Plugin, parameters):
         success, plugin = hrd.init_plugin(Plugin, parameters=parameters)
         
         if success:
-            hrd.core.commit()
+            plugin.core.commit()
             return plugin
         
         elif plugin is not None:
@@ -72,10 +72,10 @@ if __name__ == '__main__':
     command = sys.argv[2]
     args = sys.argv[3:]
     
-    config = hoordu.load_config('hoordu.conf')
+    config = hoordu.Settings.from_module('hoordu.conf')
     hrd = hoordu.hoordu(config)
     
-    plugin_config = hoordu.load_config('{0}/{0}.conf'.format(plugin_name))
+    plugin_config = hoordu.Settings.from_module('{0}/{0}.conf'.format(plugin_name))
     Plugin = load_module('{0}/{0}.py'.format(plugin_name)).Plugin
     
     plugin = init(hrd, Plugin, plugin_config)

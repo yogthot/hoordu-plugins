@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-CONSUMER_KEY = None
-CONSUMER_SECRET = None
-
 # these options are appended to the end of image urls when downloading
 THUMB_SIZE = 'small'
 ORIG_SIZE = 'orig'
@@ -20,8 +17,9 @@ from urllib.parse import urlparse
 import urllib3
 http = urllib3.PoolManager()
 
-from hoordu.models import RemotePost, PostType, RemoteTag, TagCategory, File, Subscription, SourceSetupState, Related
-from hoordu.plugins import FetchDirection
+import hoordu
+from hoordu.models import *
+from hoordu.plugins import *
 
 from requests_oauthlib import OAuth1Session
 import twitter
@@ -76,7 +74,7 @@ def unwind_url(url):
     
     return final_url
 
-class TweetIterator(object):
+class TweetIterator:
     def __init__(self, twitter, subscription=None, options=None):
         self.twitter = twitter
         self.api = twitter.api
@@ -84,8 +82,8 @@ class TweetIterator(object):
         self.subscription = subscription
         
         if self.subscription is not None:
-            options = json.loads(self.subscription.options)
-            self.state = json.loads(self.subscription.state)
+            options = hoordu.Settings.from_json(self.subscription.options)
+            self.state = hoordu.Settings.from_json(self.subscription.state)
         else:
             self.state = {}
         
@@ -209,49 +207,30 @@ class TweetIterator(object):
         
         return posts
 
-class Twitter(object):
+class Twitter:
     name = 'twitter'
     version = 1
     
+    _config_keys = ['consumer_key', 'consumer_secret', 'access_token_key', 'access_token_secret']
     @classmethod
     def init(cls, core, parameters=None):
-        source = core.register_source(cls.name)
+        source = core.source
         
-        cls.update(core, source)
+        cls.update(core)
         
         # check if everything is ready to use
-        config = json.loads(source.config)
-        consumer_key = config.get('consumer_key', CONSUMER_KEY)
-        consumer_secret = config.get('consumer_secret', CONSUMER_SECRET)
+        config = hoordu.Settings.from_json(source.config)
         
-        access_token_key = config.get('access_token_key', None)
-        access_token_secret = config.get('access_token_secret', None)
-        
-        # TODO find a cleaner way to do this
-        if consumer_key is None or consumer_secret is None:
+        if not config.contains('consumer_key', 'consumer_secret'):
             # try to get the values from the parameters
             if parameters is not None:
-                consumer_key = parameters.get('consumer_key', None)
-                consumer_secret = parameters.get('consumer_secret', None)
-                access_token_key = parameters.get('access_token_key', None)
-                access_token_secret = parameters.get('access_token_secret', None)
-                
-                # TODO need a better way to do this
-                # e.g. config = {k:v for k,v in vars(parameters) if k in C}
-                # though parameters might be a dict itself
-                # try implementing iteration in the hoordu config loader
-                config['consumer_key'] = consumer_key
-                config['consumer_secret'] = consumer_secret
-                config['access_token_key'] = access_token_key
-                config['access_token_secret'] = access_token_secret
-                
-                config['sub_preview'] = parameters.get('sub_preview', None)
+                config.update((k, parameters[k]) for k in cls._config_keys if k in parameters)
                 
                 source.config = json.dumps(config)
                 core.add(source)
         
         
-        if consumer_key is None or consumer_secret is None:
+        if not config.contains('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
             source.setup_state = SourceSetupState.config
             core.add(source)
@@ -259,48 +238,46 @@ class Twitter(object):
             # request the values to be sent into parameters
             return False, None
         
-        elif access_token_key is None or access_token_secret is None:
+        elif not config.contains('access_token_key', 'access_token_secret'):
             pin = None
             if parameters is not None:
                 pin = parameters.get('user_input')
             
             if pin is None:
-                oauth_token, oauth_token_secret, url = oauth_start(consumer_key, consumer_secret)
+                oauth_token, oauth_token_secret, url = oauth_start(config.consumer_key, config.consumer_secret)
                 
-                config['oauth_token'] = oauth_token
-                config['oauth_token_secret'] = oauth_token_secret
+                config.oauth_token = oauth_token
+                config.oauth_token_secret = oauth_token_secret
                 source.setup_state = SourceSetupState.setup
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
                 
                 return False, url
                 
             else:
-                oauth_token = config['oauth_token']
-                oauth_token_secret = config['oauth_token_secret']
+                oauth_token = config.pop('oauth_token')
+                oauth_token_secret = config.pop('oauth_token_secret')
                 
                 access_token_key, access_token_secret = oauth_finish(
-                    consumer_key, consumer_secret,
+                    config.consumer_key, config.consumer_secret,
                     oauth_token, oauth_token_secret,
                     pin)
                     
-                config['access_token_key'] = access_token_key
-                config['access_token_secret'] = access_token_secret
+                config.access_token_key = access_token_key
+                config.access_token_secret = access_token_secret
                 source.setup_state = SourceSetupState.ready
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
                 
-                return True, cls(core, source)
+                return True, cls(core)
             
         else:
-            # everything should be fine
-            return True, cls(core, source)
+            # the config contains every required property
+            return True, cls(core)
     
     @classmethod
-    def update(cls, core, source):
-        if source.config is None:
-            source.config = '{}'
-            core.add(source)
+    def update(cls, core):
+        source = core.source
         
         if source.version < cls.version:
             # update anything if needed
@@ -309,27 +286,25 @@ class Twitter(object):
             source.version = cls.version
             core.add(source)
     
-    def __init__(self, core, source, config=None):
+    def __init__(self, core, config=None):
         self.core = core
-        self.source = source
+        self.source = core.source
         self.log = core.logger
         self.session = core.session
         
-        if config is not None:
-            self._load_config(config)
-        else:
-            self._load_config(json.loads(source.config))
+        if config is None:
+            config = hoordu.Settings.from_json(self.source.config)
+        
+        self._load_config(config)
         
         self._init_api()
     
     def _load_config(self, config):
-        self.consumer_key = config.get('consumer_key', CONSUMER_KEY)
-        self.consumer_secret = config.get('consumer_secret', CONSUMER_SECRET)
+        self.consumer_key = config.consumer_key
+        self.consumer_secret = config.consumer_secret
         
         self.access_token_key = config.get('access_token_key', None)
         self.access_token_secret = config.get('access_token_secret', None)
-        
-        self.sub_preview = config.get('sub_preview', True)
     
     def _init_api(self):
         self.api = twitter.Api(
@@ -337,33 +312,8 @@ class Twitter(object):
             consumer_secret=self.consumer_secret,
             access_token_key=self.access_token_key,
             access_token_secret=self.access_token_secret,
-            tweet_mode='extended')
-        
-        credentials = self.api.VerifyCredentials()
-        
-        self.user = credentials.screen_name
-    
-    def test(self):
-        # to be used in the future, might as well implement now (even if it just returns true)
-        # this function will be manually called by the user and is used to test if the api works with the current configuration
-        # usually, this means making the simplest call to the api to make sure everything is working properly
-        # if no problem is found with the config this method should always return True, even if there is a temporary network problem that prevents connectivity
-        
-        # this method will not be called unless Twitter.init actually returns an instance, so we only need to test the api itself
-        # if this function returns False, then setup_state should be set to an appropriate value
-        return True
-    
-    def get_url(self, remote_post):
-        """
-        Gets the url for a RemotePost.
-        This function should the stored information to generate the url.
-        If the original_id is not enough, any extra data (or even the url itself),
-        should be stored in the metadata field.
-        If no url can be generated, then None should be returned.
-        """
-        
-        metadata = json.loads(remote_post.metadata_)
-        return TWEET_FORMAT.format(user=metadata.get('user', '_'), tweet_id=remote_post.original_id)
+            tweet_mode='extended'
+        )
     
     def can_download(self, url):
         """
@@ -371,6 +321,7 @@ class Twitter(object):
         
         Returns True if this plugin is able to download the url.
         """
+        
         is_valid_url = bool(TWEET_REGEXP.match(url))
         is_digit = url.isdigit()
         return is_valid_url or is_digit
@@ -427,7 +378,7 @@ class Twitter(object):
         
         return thumb, orig
     
-    def tweet_to_remote_post(self, tweet, preview=False):
+    def tweet_to_remote_post(self, tweet, remote_post=None, preview=False):
         # get the original tweet if this is a retweet
         if tweet.retweeted_status is not None:
             tweet = tweet.retweeted_status
@@ -439,49 +390,54 @@ class Twitter(object):
         
         self.log.info('getting tweet %s', original_id)
         
-        post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
-        if post is None:
-            self.log.info('creating new post')
-            post = RemotePost(
-                source=self.source,
-                original_id=original_id,
-                comment=text,
-                type=PostType.set,
-                post_time=post_time,
-                metadata_=json.dumps({'user': user})
-            )
-            
-            user_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.artist, tag=user)
-            post.tags.append(user_tag)
-            
-            if tweet.favorited is True:
-                post.favorite = True
-            
-            if tweet.possibly_sensitive:
-                nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.meta, tag='nsfw')
-                post.tags.append(nsfw_tag)
-            
-            if tweet.hashtags is not None:
-                for hashtag in tweet.hashtags:
-                    tag = hashtag.text
-                    nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.general, tag=tag)
-                    post.tags.append(nsfw_tag)
-            
-            if tweet.in_reply_to_status_id is not None:
-                url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
-                post.related.append(Related(url=url))
-            
-            if tweet.urls is not None:
-                for url in tweet.urls:
-                    # the unwound section is a premium feature
-                    self.log.info('found url %s', url.url)
-                    final_url = unwind_url(url.url)
-                    post.related.append(Related(url=final_url))
-            
-            self.core.add(post)
-            
+        if remote_post is not None:
+            post = remote_post
+        
         else:
-            self.log.info('post already exists: %s', post.id)
+            post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
+            if post is None:
+                self.log.info('creating new post')
+                post = RemotePost(
+                    source=self.source,
+                    original_id=original_id,
+                    url=TWEET_FORMAT.format(user=user, tweet_id=original_id),
+                    comment=text,
+                    type=PostType.set,
+                    post_time=post_time,
+                    metadata_=json.dumps({'user': user})
+                )
+                
+                user_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.artist, tag=user)
+                post.tags.append(user_tag)
+                
+                if tweet.favorited is True:
+                    post.favorite = True
+                
+                if tweet.possibly_sensitive:
+                    nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.meta, tag='nsfw')
+                    post.tags.append(nsfw_tag)
+                
+                if tweet.hashtags is not None:
+                    for hashtag in tweet.hashtags:
+                        tag = hashtag.text
+                        nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.general, tag=tag)
+                        post.tags.append(nsfw_tag)
+                
+                if tweet.in_reply_to_status_id is not None:
+                    url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
+                    post.related.append(Related(url=url))
+                
+                if tweet.urls is not None:
+                    for url in tweet.urls:
+                        # the unwound section is a premium feature
+                        self.log.info('found url %s', url.url)
+                        final_url = unwind_url(url.url)
+                        post.related.append(Related(url=final_url))
+                
+                self.core.add(post)
+                
+            else:
+                self.log.info('post already exists: %s', post.id)
         
         if tweet.media is not None:
             available = set(range(len(tweet.media)))
@@ -504,31 +460,42 @@ class Twitter(object):
         
         return post
     
-    def download(self, url, preview=False):
+    def download(self, url=None, remote_post=None, preview=False):
         """
         Creates or updates a RemotePost entry along with all the associated Files,
         and downloads all files and thumbnails that aren't present yet.
+        
+        If remote_post is passed, its original_id will be used and it will be
+        updated in place.
         
         If preview is set to True, then only the thumbnails are downloaded.
         
         Returns the downloaded RemotePost object.
         """
         
-        self.log.info('download request for %s', url)
-        if url.isdigit():
-            tweet_id = url
+        if url is None and remote_post is None:
+            raise ValueError('either url or remote_post must be passed')
+        
+        if remote_post is not None:
+            tweet_id = remote_post.original_id
+            self.log.info('update request for %s', tweet_id)
             
         else:
-            match = TWEET_REGEXP.match(url)
-            if not match:
-                raise ValueError('unsupported url: {}'.format(repr(url)))
-            
-            tweet_id = match.group('tweet_id')
+            self.log.info('download request for %s', url)
+            if url.isdigit():
+                tweet_id = url
+                
+            else:
+                match = TWEET_REGEXP.match(url)
+                if not match:
+                    raise ValueError('unsupported url: {}'.format(repr(url)))
+                
+                tweet_id = match.group('tweet_id')
         
         tweet = self.api.GetStatus(tweet_id)
         self.log.debug('tweet: %s', tweet)
         
-        return self.tweet_to_remote_post(tweet, preview)
+        return self.tweet_to_remote_post(tweet, remote_post=remote_post, preview=preview)
     
     _supported_methods = ['tweets', 'retweets', 'likes']
     def create_subscription(self, name, options=None, iterator=None):
@@ -596,6 +563,5 @@ class Twitter(object):
         """
         
         return TweetIterator(self, subscription=subscription)
-    
 
 Plugin = Twitter
