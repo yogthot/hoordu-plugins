@@ -20,6 +20,7 @@ http = urllib3.PoolManager()
 import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
+from hoordu.forms import *
 
 from requests_oauthlib import OAuth1Session
 import twitter
@@ -29,7 +30,8 @@ OAUTH_ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
 OAUTH_AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
-TWEET_REGEXP = re.compile('^https?:\/\/twitter.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:/.*)?(?:\?.*)?$')
+TWEET_REGEXP = re.compile('^https?:\/\/twitter.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$')
+TIMELINE_REGEXP = re.compile('^https?:\/\/twitter.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$')
 
 def oauth_start(consumer_key, consumer_secret):
     oauth_client = OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri='oob')
@@ -85,22 +87,22 @@ class TweetIterator:
             options = hoordu.Settings.from_json(self.subscription.options)
             self.state = hoordu.Settings.from_json(self.subscription.state)
         else:
-            self.state = {}
+            self.state = hoordu.Settings()
         
-        if options is None or 'method' not in options or 'user' not in options:
-            raise ValueError('search options are invalid: {}'.format(options))
+        if options is None or not options.defined('method', 'user'):
+            raise ValueError('search options are invalid: {}'.format(repr(options)))
         
-        self.method = options['method']
-        self.user = options['user']
+        self.method = options.method
+        self.user = options.user
         
         self.head_id = self.state.get('head_id')
         self.tail_id = self.state.get('tail_id')
     
     def _save_state(self):
-        self.state['head_id'] = self.head_id
-        self.state['tail_id'] = self.tail_id
+        self.state.head_id = self.head_id
+        self.state.tail_id = self.tail_id
         if self.subscription is not None:
-            self.subscription.state = json.dumps(self.state)
+            self.subscription.state = self.state.to_json()
     
     def _page_iterator(self, method, limit=None, max_id=None, **kwargs):
         total = 0
@@ -209,9 +211,17 @@ class TweetIterator:
 
 class Twitter:
     name = 'twitter'
-    version = 1
+    version = 3
     
-    _config_keys = ['consumer_key', 'consumer_secret', 'access_token_key', 'access_token_secret']
+    @classmethod
+    def config_form(cls):
+        return Form('{} config'.format(cls.name),
+            ('consumer_key', Input('consumer key', [validators.required])),
+            ('consumer_secret', Input('consumer secret', [validators.required])),
+            ('access_token_key', Input('access token key')),
+            ('access_token_secret', Input('access token secret'))
+        )
+    
     @classmethod
     def init(cls, core, parameters=None):
         source = core.source
@@ -221,38 +231,37 @@ class Twitter:
         # check if everything is ready to use
         config = hoordu.Settings.from_json(source.config)
         
-        if not config.contains('consumer_key', 'consumer_secret'):
+        if not config.defined('consumer_key', 'consumer_secret'):
             # try to get the values from the parameters
             if parameters is not None:
-                config.update((k, parameters[k]) for k in cls._config_keys if k in parameters)
+                config.update(parameters)
                 
                 source.config = json.dumps(config)
                 core.add(source)
         
-        
-        if not config.contains('consumer_key', 'consumer_secret'):
+        if not config.defined('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
-            source.setup_state = SourceSetupState.config
-            core.add(source)
-            #core.commit()
-            # request the values to be sent into parameters
-            return False, None
+            return False, cls.config_form()
         
-        elif not config.contains('access_token_key', 'access_token_secret'):
+        elif not config.defined('access_token_key', 'access_token_secret'):
             pin = None
             if parameters is not None:
-                pin = parameters.get('user_input')
+                pin = parameters.get('pin')
             
             if pin is None:
                 oauth_token, oauth_token_secret, url = oauth_start(config.consumer_key, config.consumer_secret)
                 
                 config.oauth_token = oauth_token
                 config.oauth_token_secret = oauth_token_secret
-                source.setup_state = SourceSetupState.setup
                 source.config = config.to_json()
                 core.add(source)
                 
-                return False, url
+                oauth_form = Form('twitter authentication',
+                    Label('please login to twitter via this url to get your pin:\n{}'.format(url)),
+                    ('pin', Input('pin', [validators.required]))
+                )
+                
+                return False, oauth_form
                 
             else:
                 oauth_token = config.pop('oauth_token')
@@ -265,7 +274,6 @@ class Twitter:
                     
                 config.access_token_key = access_token_key
                 config.access_token_secret = access_token_secret
-                source.setup_state = SourceSetupState.ready
                 source.config = config.to_json()
                 core.add(source)
                 
@@ -315,16 +323,37 @@ class Twitter:
             tweet_mode='extended'
         )
     
-    def can_download(self, url):
+    def parse_url(self, url):
         """
         Checks if an url can be downloaded by this plugin.
         
-        Returns True if this plugin is able to download the url.
+        Returns the remote id if the url corresponds to a single post,
+        a Settings object that can be passed to search if the url
+        corresponds to multiple posts, or None if this plugin can't
+        download or create a search with this url.
         """
         
-        is_valid_url = bool(TWEET_REGEXP.match(url))
-        is_digit = url.isdigit()
-        return is_valid_url or is_digit
+        if url.isdigit():
+            return url
+        
+        match = TWEET_REGEXP.match(url)
+        if match:
+            return match.group('tweet_id')
+        
+        match = TIMELINE_REGEXP.match(url)
+        if match:
+            user = match.group('user')
+            method = match.group('type')
+            
+            if method != 'likes':
+                method = 'tweets'
+            
+            return hoordu.Settings({
+                'user': user,
+                'method': method
+            })
+        
+        return None
     
     def _download_file(self, url):
         # TODO file downloads should be managed by hoordu
@@ -497,44 +526,15 @@ class Twitter:
         
         return self.tweet_to_remote_post(tweet, remote_post=remote_post, preview=preview)
     
-    _supported_methods = ['tweets', 'retweets', 'likes']
-    def create_subscription(self, name, options=None, iterator=None):
-        """
-        Creates a Subscription entry for the given search options identified by the given name,
-        should not get any posts from the post source.
-        """
-        
-        if options is not None:
-            method, user = options.split(':')
-            
-            if method not in self._supported_methods:
-                raise ValueError('unsupported method: {}'.format(repr(method)))
-            
-            opts = {
-                'method': method,
-                'user': user
-            }
-            state = {}
-            
-            
-        elif iterator is not None:
-            opts = {
-                'method': iterator.method,
-                'user': iterator.user
-            }
-            state = iterator.state
-        
-        sub = Subscription(
-            source=self.source,
-            name=name,
-            options=json.dumps(opts),
-            state=json.dumps(state)
+    def search_form(self):
+        return Form('{} search'.format(self.name),
+            ('method', ChoiceInput('method', [
+                    ('tweets', 'tweets'),
+                    ('retweets', 'retweets'),
+                    ('likes', 'likes')
+                ], [validators.required()])),
+            ('user', Input('screen name', [validators.required()]))
         )
-        
-        self.core.add(sub)
-        self.core.flush()
-        
-        return sub
     
     def search(self, options):
         """
@@ -555,6 +555,37 @@ class Twitter:
         
         return TweetIterator(self, options=options)
     
+    def create_subscription(self, name, options=None, iterator=None):
+        """
+        Creates a Subscription entry for the given search options identified by the given name,
+        should not get any posts from the post source.
+        """
+        
+        if iterator is not None:
+            options = hoordu.Settings({
+                'method': iterator.method,
+                'user': iterator.user
+            })
+            state = iterator.state
+            
+        elif options is not None:
+            state = hoordu.Settings()
+        
+        sub = Subscription(
+            source=self.source,
+            name=name,
+            options=options.to_json(),
+            state=state.to_json()
+        )
+        
+        self.core.add(sub)
+        self.core.flush()
+        
+        if iterator is not None:
+            iterator.subscription = sub
+        
+        return sub
+    
     def get_iterator(self, subscription):
         """
         Gets the post iterator for a specific subscription.
@@ -565,3 +596,5 @@ class Twitter:
         return TweetIterator(self, subscription=subscription)
 
 Plugin = Twitter
+
+

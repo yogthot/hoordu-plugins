@@ -4,10 +4,12 @@ import sys
 from pathlib import Path
 import importlib.util
 import traceback
+from getpass import getpass
 
 import hoordu
 from hoordu.models import Source, Subscription
 from hoordu.plugins import FetchDirection
+from hoordu.forms import *
 
 def load_module(filename):
     module_name = Path(filename).name.split('.')[0]
@@ -23,11 +25,23 @@ def usage():
     print('    download <url>')
     print('        attempts to download the given url')
     print('')
-    print('    sub <sub_name> <sub_search>')
-    print('        creates a subscription with the given name and search')
+    print('    sub <sub_name> <url>')
+    print('        creates a subscription with the given name and feed')
+    print('')
+    print('    unsub <sub_name>')
+    print('        deletes a subscription')
+    print('')
+    print('    list')
+    print('        lists all subscriptions')
     print('')
     print('    update <sub_name>')
     print('        gets all new posts for a subscription')
+    print('')
+    print('    update-all')
+    print('        gets all new posts for every subscription')
+    print('')
+    print('    fetch <sub_name> <n>')
+    print('        gets n posts for a subscription')
     print('')
     print('    fetch <sub_name> <n>')
     print('        gets <n> old posts from a subscription')
@@ -36,9 +50,63 @@ def fail(format, *args, **kwargs):
     print(format.format(*args, **kwargs))
     sys.exit(1)
 
+def _cli_form(form):
+    form.clear()
+    
+    print('== {} ==========='.format(form.label))
+    for entry in form.entries:
+        if isinstance(entry, Section):
+            print('-- {} ----------'.format(entry.label))
+            print()
+            execute_form(entry)
+            print('--------------' + '-' * len(entry.label))
+        
+        else:
+            if entry.errors:
+                for error in entry.errors:
+                    print('error: {}'.format(error))
+                
+            if isinstance(entry, Label):
+                print(entry.label)
+                print()
+                
+            elif isinstance(entry, PasswordInput):
+                value = getpass('{}: '.format(entry.label))
+                if value: entry.value = value
+                
+            elif isinstance(entry, ChoiceInput):
+                print('{}:'.format(entry.label))
+                for k, v in entry.choices:
+                    print('    {}: {}'.format(k, v))
+                value = input('pick a choice: ')
+                if value: entry.value = value
+                
+            elif isinstance(entry, Input):
+                value = input('{}: '.format(entry.label))
+                if value: entry.value = value
+                
+            else:
+                print()
+
+def cli_form(form):
+    _cli_form(form)
+    while not form.validate():
+        _cli_form(form)
 
 # this should be the general approach to initialization of a plugin
-def init(hrd, Plugin, parameters):
+def init(hrd, Plugin, parameters=None):
+    source_exists = hrd.session.query(Source.id).filter(Source.name == Plugin.name).scalar() is not None
+    
+    if not source_exists:
+        form = Plugin.config_form()
+        if parameters is not None:
+            form.fill(parameters)
+        
+        if not form.validate():
+            cli_form(form)
+        
+        parameters = form.value
+    
     while True:
         # attempt to init
         success, plugin = hrd.init_plugin(Plugin, parameters=parameters)
@@ -51,13 +119,11 @@ def init(hrd, Plugin, parameters):
             # if not successful but something else was returned
             # then attempt to ask the user for input
             
-            # TODO simple forms
-            prompt = plugin
-            
-            user_input = input('{}: '.format(prompt))
+            form = plugin
+            cli_form(form)
             
             # update parameters and try again
-            parameters = {'user_input': user_input}
+            parameters = form.value
         
         else:
             print('something went wrong with the authentication')
@@ -86,8 +152,9 @@ if __name__ == '__main__':
         if command == 'download':
             url = args[0]
             
-            if plugin.can_download(url):
-                remote_post = plugin.download(url, preview=False)
+            id = plugin.parse_url(url)
+            if isinstance(id, str):
+                remote_post = plugin.download(id, preview=False)
                 core.commit()
                 
                 print('related urls:')
@@ -98,16 +165,25 @@ if __name__ == '__main__':
             
         elif command == 'sub':
             sub_name = args[0]
-            sub_search = args[1]
+            url = args[1]
             
             sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is None:
-                print('creating subscription \'{0}\' with search \'{1}\''.format(sub_name, sub_search))
-                sub = plugin.create_subscription(sub_name, sub_search)
-                core.commit()
+                print('creating subscription {0} for {1}'.format(repr(sub_name), url))
+                options = plugin.parse_url(url)
+                if isinstance(options, hoordu.Settings):
+                    sub = plugin.create_subscription(sub_name, options)
+                    core.commit()
+                else:
+                    fail('invalid url')
                 
             else:
                 fail('subscription named \'{0}\' already exists', sub_name)
+            
+        elif command == 'list':
+            subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
+            for sub in subs:
+                print('\'{0}\': {1}'.format(sub.name, sub.options))
             
         elif command == 'update':
             sub_name = args[0]
@@ -121,11 +197,6 @@ if __name__ == '__main__':
                 
             else:
                 fail('subscription named \'{0}\' doesn\'t exist', sub_name)
-            
-        elif command == 'list':
-            subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
-            for sub in subs:
-                print('\'{0}\': {1}'.format(sub.name, sub.options))
             
         elif command == 'update-all':
             subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
