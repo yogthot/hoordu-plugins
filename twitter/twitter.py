@@ -14,6 +14,7 @@ from datetime import datetime
 from tempfile import mkstemp
 import shutil
 from urllib.parse import urlparse
+import functools
 import urllib3
 http = urllib3.PoolManager()
 
@@ -64,7 +65,7 @@ def unwind_url(url):
     final_url = url
     try:
         while url is not None:
-            resp = http.request('HEAD', url, redirect=False)
+            resp = http.request('HEAD', url, redirect=False, timeout=10)
             if resp.status // 100 == 3:
                 url = resp.headers.get('Location')
                 if url is not None:
@@ -84,10 +85,10 @@ class TweetIterator:
         self.subscription = subscription
         
         if self.subscription is not None:
-            options = hoordu.Settings.from_json(self.subscription.options)
-            self.state = hoordu.Settings.from_json(self.subscription.state)
+            options = hoordu.Dynamic.from_json(self.subscription.options)
+            self.state = hoordu.Dynamic.from_json(self.subscription.state)
         else:
-            self.state = hoordu.Settings()
+            self.state = hoordu.Dynamic()
         
         if options is None or not options.defined('method', 'user'):
             raise ValueError('search options are invalid: {}'.format(repr(options)))
@@ -161,6 +162,18 @@ class TweetIterator:
         
         return tweets
     
+    def _tweet_has_content(self, tweet):
+        if tweet.retweeted_status is not None:
+            tweet = tweet.retweeted_status
+        
+        return ((
+            tweet.media is not None and
+            len(tweet.media) > 0
+        ) or (
+            tweet.urls is not None and
+            len(tweet.urls) > 0
+        ))
+    
     def fetch(self, direction=FetchDirection.newer, n=None):
         """
         Try to get at least `n` newer or older posts from this search
@@ -190,16 +203,17 @@ class TweetIterator:
             if direction == FetchDirection.older:
                 self.tail_id = tweet.id_str
             
-            post = self.twitter.tweet_to_remote_post(tweet, preview=self.subscription is None)
-            posts.append(post)
+            if self._tweet_has_content(tweet):
+                post = self.twitter.tweet_to_remote_post(tweet, preview=self.subscription is None)
+                posts.append(post)
+                
+                if self.subscription is not None:
+                    self.subscription.feed.append(post)
             
-            if self.subscription is not None:
-                self.subscription.feed.append(post)
-            
-            # always commit changes
-            # RemotePost, RemoteTag and the subscription feed are simply a cache
-            # the file downloads are more expensive than a call to the database
-            self.twitter.core.commit()
+                # always commit changes
+                # RemotePost, RemoteTag and the subscription feed are simply a cache
+                # the file downloads are more expensive than a call to the database
+                self.twitter.core.commit()
             
             first_iteration = False
         
@@ -229,7 +243,7 @@ class Twitter:
         cls.update(core)
         
         # check if everything is ready to use
-        config = hoordu.Settings.from_json(source.config)
+        config = hoordu.Dynamic.from_json(source.config)
         
         if not config.defined('consumer_key', 'consumer_secret'):
             # try to get the values from the parameters
@@ -301,7 +315,7 @@ class Twitter:
         self.session = core.session
         
         if config is None:
-            config = hoordu.Settings.from_json(self.source.config)
+            config = hoordu.Dynamic.from_json(self.source.config)
         
         self._load_config(config)
         
@@ -328,7 +342,7 @@ class Twitter:
         Checks if an url can be downloaded by this plugin.
         
         Returns the remote id if the url corresponds to a single post,
-        a Settings object that can be passed to search if the url
+        a Dynamic object that can be passed to search if the url
         corresponds to multiple posts, or None if this plugin can't
         download or create a search with this url.
         """
@@ -348,7 +362,7 @@ class Twitter:
             if method != 'likes':
                 method = 'tweets'
             
-            return hoordu.Settings({
+            return hoordu.Dynamic({
                 'user': user,
                 'method': method
             })
@@ -369,6 +383,7 @@ class Twitter:
         
         with http.request('GET', url, preload_content=False) as resp, \
                 os.fdopen(fd, 'w+b') as file:
+            resp.read = functools.partial(resp.read, decode_content=True)
             shutil.copyfileobj(resp, file)
         
         return path
@@ -436,20 +451,20 @@ class Twitter:
                     metadata_=json.dumps({'user': user})
                 )
                 
-                user_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.artist, tag=user)
+                user_tag = self.core.get_remote_tag(TagCategory.artist, user)
                 post.tags.append(user_tag)
                 
                 if tweet.favorited is True:
                     post.favorite = True
                 
                 if tweet.possibly_sensitive:
-                    nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.meta, tag='nsfw')
+                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
                     post.tags.append(nsfw_tag)
                 
                 if tweet.hashtags is not None:
                     for hashtag in tweet.hashtags:
                         tag = hashtag.text
-                        nsfw_tag = self.core.get_remote_tag(source=self.source, category=TagCategory.general, tag=tag)
+                        nsfw_tag = self.core.get_remote_tag(TagCategory.general, tag)
                         post.tags.append(nsfw_tag)
                 
                 if tweet.in_reply_to_status_id is not None:
@@ -483,7 +498,7 @@ class Twitter:
                 need_file = not file.present and not preview
                 
                 if need_thumb or need_file:
-                    self.log.info('downloading files for post: %s, file: %r, thumb: %r', post.id, need_file, need_thumb)
+                    self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
                     thumb, orig = self._download_media(tweet.media[file.remote_order], thumbnail=need_thumb, file=need_file)
                     self.core.import_file(file, orig=orig, thumb=thumb, move=True)
         
@@ -543,16 +558,6 @@ class Twitter:
         Returns a post iterator object.
         """
         
-        method, user = options.split(':')
-        
-        if method not in self._supported_methods:
-            raise ValueError('unsupported method: {}'.format(repr(method)))
-        
-        options = {
-            'method': method,
-            'user': user
-        }
-        
         return TweetIterator(self, options=options)
     
     def create_subscription(self, name, options=None, iterator=None):
@@ -562,14 +567,14 @@ class Twitter:
         """
         
         if iterator is not None:
-            options = hoordu.Settings({
+            options = hoordu.Dynamic({
                 'method': iterator.method,
                 'user': iterator.user
             })
             state = iterator.state
             
         elif options is not None:
-            state = hoordu.Settings()
+            state = hoordu.Dynamic()
         
         sub = Subscription(
             source=self.source,

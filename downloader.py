@@ -41,10 +41,10 @@ def usage():
     print('        gets all new posts for every subscription')
     print('')
     print('    fetch <sub_name> <n>')
-    print('        gets n posts for a subscription')
+    print('        gets <n> older posts for a subscription')
     print('')
-    print('    fetch <sub_name> <n>')
-    print('        gets <n> old posts from a subscription')
+    print('    rfetch <sub_name> <n>')
+    print('        gets <n> newer posts from a subscription')
 
 def fail(format, *args, **kwargs):
     print(format.format(*args, **kwargs))
@@ -129,6 +129,30 @@ def init(hrd, Plugin, parameters=None):
             print('something went wrong with the authentication')
             sys.exit(1)
 
+def safe_fetch(plugin, it, direction, n):
+    done = False
+    while not done:
+        try:
+            it.fetch(direction=direction, n=n)
+            done = True
+        except KeyboardInterrupt:
+            raise
+        except:
+            traceback.print_exc()
+            if it.subscription is not None:
+                name = it.subscription.name
+                print('subscription "{0}" ran into an error'.format(name))
+                v = input('do you want to retry? (Yn) ')
+                if not v: v = 'y'
+                if v.lower() == 'y':
+                    # make sure we retry from a valid db state
+                    plugin.core.flush()
+                    n = 1
+                    continue
+                    
+                else:
+                    raise
+
 if __name__ == '__main__':
     if len(sys.argv) < 3:
         usage()
@@ -138,15 +162,16 @@ if __name__ == '__main__':
     command = sys.argv[2]
     args = sys.argv[3:]
     
-    config = hoordu.Settings.from_module('hoordu.conf')
+    config = hoordu.Dynamic.from_module('hoordu.conf')
     hrd = hoordu.hoordu(config)
     
-    plugin_config = hoordu.Settings.from_module('{0}/{0}.conf'.format(plugin_name))
+    plugin_config = hoordu.Dynamic.from_module('{0}/{0}.conf'.format(plugin_name))
     Plugin = load_module('{0}/{0}.py'.format(plugin_name)).Plugin
     
     plugin = init(hrd, Plugin, plugin_config)
     
     core = plugin.core
+    core.commit()
     
     try:
         if command == 'download':
@@ -171,7 +196,7 @@ if __name__ == '__main__':
             if sub is None:
                 print('creating subscription {0} for {1}'.format(repr(sub_name), url))
                 options = plugin.parse_url(url)
-                if isinstance(options, hoordu.Settings):
+                if isinstance(options, hoordu.Dynamic):
                     sub = plugin.create_subscription(sub_name, options)
                     core.commit()
                 else:
@@ -192,7 +217,7 @@ if __name__ == '__main__':
             if sub is not None:
                 print('getting all new posts for subscription \'{0}\''.format(sub_name))
                 it = plugin.get_iterator(sub)
-                it.fetch(direction=FetchDirection.newer, n=None)
+                safe_fetch(plugin, it, FetchDirection.newer, None)
                 core.commit()
                 
             else:
@@ -204,10 +229,11 @@ if __name__ == '__main__':
                 try:
                     print('getting all new posts for subscription \'{0}\''.format(sub.name))
                     it = plugin.get_iterator(sub)
-                    it.fetch(direction=FetchDirection.newer, n=None)
+                    safe_fetch(plugin, it, FetchDirection.newer, None)
                     core.commit()
+                except KeyboardInterrupt:
+                    raise
                 except:
-                    traceback.print_exc()
                     core.rollback()
             
         elif command == 'fetch':
@@ -216,9 +242,23 @@ if __name__ == '__main__':
             
             sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
             if sub is not None:
-                print('fetching {0} posts for subscription \'{1}\''.format(num_posts, sub_name))
+                print('fetching {0} older posts for subscription \'{1}\''.format(num_posts, sub_name))
                 it = plugin.get_iterator(sub)
-                it.fetch(direction=FetchDirection.older, n=num_posts)
+                safe_fetch(plugin, it, FetchDirection.older, num_posts)
+                core.commit()
+                
+            else:
+                fail('subscription named \'{0}\' doesn\'t exist', sub_name)
+            
+        elif command == 'rfetch':
+            sub_name = args[0]
+            num_posts = int(args[1])
+            
+            sub = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id, Subscription.name == sub_name).one_or_none()
+            if sub is not None:
+                print('fetching {0} newer posts for subscription \'{1}\''.format(num_posts, sub_name))
+                it = plugin.get_iterator(sub)
+                safe_fetch(plugin, it, FetchDirection.newer, num_posts)
                 core.commit()
                 
             else:
