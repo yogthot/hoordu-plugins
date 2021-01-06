@@ -130,25 +130,38 @@ def init(hrd, Plugin, parameters=None):
             sys.exit(1)
 
 def safe_fetch(plugin, it, direction, n):
-    done = False
-    while not done:
+    posts = {}
+    while True:
         try:
-            it.fetch(direction=direction, n=n)
-            done = True
+            for remote_post in it.fetch(direction=direction, n=n):
+                posts[remote_post.id] = remote_post
+            
+            return posts
         except KeyboardInterrupt:
             raise
         except:
             traceback.print_exc()
             if it.subscription is not None:
-                name = it.subscription.name
+                subscription = it.subscription
+                name = subscription.name
                 print('subscription "{0}" ran into an error'.format(name))
-                v = input('do you want to retry? (Yn) ')
+                print('y = retry; d = rollback, ignore and disable subscription; n = just rollback and ignore'.format(name))
+                v = input('do you want to retry? (Ynd) ').lower()
                 if not v: v = 'y'
-                if v.lower() == 'y':
+                if v == 'y':
                     # make sure we retry from a valid db state
                     plugin.core.flush()
-                    n = 1
+                    if n is not None:
+                        n -= len(posts)
                     continue
+                    
+                elif v == 'd':
+                    plugin.core.rollback()
+                    
+                    subscription.enabled = False
+                    plugin.core.add(subscription)
+                    plugin.core.commit()
+                    return
                     
                 else:
                     raise
@@ -226,15 +239,16 @@ if __name__ == '__main__':
         elif command == 'update-all':
             subs = core.session.query(Subscription).filter(Subscription.source_id == plugin.source.id)
             for sub in subs:
-                try:
-                    print('getting all new posts for subscription \'{0}\''.format(sub.name))
-                    it = plugin.get_iterator(sub)
-                    safe_fetch(plugin, it, FetchDirection.newer, None)
-                    core.commit()
-                except KeyboardInterrupt:
-                    raise
-                except:
-                    core.rollback()
+                if sub.enabled:
+                    try:
+                        print('getting all new posts for subscription \'{0}\''.format(sub.name))
+                        it = plugin.get_iterator(sub)
+                        safe_fetch(plugin, it, FetchDirection.newer, None)
+                        core.commit()
+                    except KeyboardInterrupt:
+                        raise
+                    except:
+                        core.rollback()
             
         elif command == 'fetch':
             sub_name = args[0]

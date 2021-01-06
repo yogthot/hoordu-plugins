@@ -17,8 +17,8 @@ from hoordu.plugins import *
 from hoordu.forms import *
 
 POST_FORMAT = 'https://fantia.jp/posts/{post_id}'
-POST_REGEXP = re.compile('^https?:\/\/fantia.jp\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$')
-FANCLUB_REGEXP = re.compile('^https?:\/\/fantia.jp\/fanclubs\/(?P<fanclub_id>\d+)(?:\/.*)?(?:\?.*)?(?:#.*)?$')
+POST_REGEXP = re.compile('^https?:\/\/fantia\.jp\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$')
+FANCLUB_REGEXP = re.compile('^https?:\/\/fantia\.jp\/fanclubs\/(?P<fanclub_id>\d+)(?:\/.*)?(?:\?.*)?(?:#.*)?$')
 FILENAME_REGEXP = re.compile('^[a-z0-9]+-(?P<filename>.+)$')
 
 POST_GET_URL = 'https://fantia.jp/api/v1/posts/{post_id}'
@@ -63,7 +63,7 @@ class CreatorIterator:
             post_id = fanclub.recent_posts[0].id
             self.head_id = post_id
             self.tail_id = post_id
-        
+            
         else:
             # TODO the post might have been deleted
             # there's no issue if we get all the posts from the beginning up until the head
@@ -112,10 +112,10 @@ class CreatorIterator:
         if self.tail_id is None:
             direction = FetchDirection.older
         
-        posts = []
         for post in self._post_iterator(direction, n):
             remote_posts = self.fantia._to_remote_posts(post, preview=self.subscription is None)
-            posts.extend(remote_posts)
+            for remote_post in remote_posts:
+                yield remote_post
             
             if self.subscription is not None:
                 for p in remote_posts:
@@ -129,8 +129,6 @@ class CreatorIterator:
         self._save_state()
         if self.subscription is not None:
             self.fantia.core.add(self.subscription)
-        
-        return posts
 
 class Fantia:
     name = 'fantia'
@@ -285,6 +283,9 @@ class Fantia:
                     metadata_=json.dumps(metadata)
                 )
                 
+                if post.liked is True:
+                    remote_post.favorite = True
+                
                 # creators are identified by their id because their name can change
                 creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
@@ -325,29 +326,28 @@ class Fantia:
                     
                 else:
                     thumb = None
-                    file.thumb_present = True
-                    self.core.add(file)
                 
                 self.core.import_file(file, orig=orig, thumb=thumb, move=True)
             
         elif content.category == 'photo_gallery':
-            available = set(range(len(content.post_content_photos)))
-            present = set(file.remote_order for file in remote_post.files)
+            current_files = {file.remote_order: file for file in remote_post.files}
             
-            for order in available - present:
-                file = File(remote=remote_post, remote_order=order)
-                self.core.add(file)
-                self.core.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
-            
-            for file in remote_post.files:
+            for photo in content.post_content_photos:
+                order = int(photo.id)
+                file = current_files.get(order)
+                
+                if file is None:
+                    file = File(remote=remote_post, remote_order=order)
+                    self.core.add(file)
+                    self.core.flush()
+                    self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
+                
                 need_orig = not file.present and not preview
                 need_thumb = not file.thumb_present
                 
                 if need_thumb or need_orig:
                     self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
                     
-                    photo = content.post_content_photos[file.remote_order]
                     orig = self._download_file(photo.url.original) if need_orig else None
                     thumb = self._download_file(photo.url.medium) if need_thumb else None
                     
@@ -356,6 +356,7 @@ class Fantia:
         elif content.category == 'text':
             # there are no files to save
             remote_post.type = PostType.set
+            self.core.add(remote_post)
             
         elif content.category == 'blog':
             current_files = {file.remote_order: file for file in remote_post.files}
@@ -406,12 +407,12 @@ class Fantia:
             
             remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
             remote_post.type = PostType.blog
+            self.core.add(remote_post)
             
         else:
             raise ValueError('unknown content category: {}'.format(content.category))
         
         return remote_post
-        
     
     def _to_remote_posts(self, post, remote_post=None, preview=False):
         main_id = str(post.id)
@@ -448,6 +449,9 @@ class Fantia:
                     type=PostType.collection,
                     post_time=post_time
                 )
+                
+                if post.liked is True:
+                    remote_post.favorite = True
                 
                 # creators are identified by their id because their name can change
                 creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
@@ -501,7 +505,6 @@ class Fantia:
                     remote_post.related.append(Related(remote=content_post))
         
         return remote_posts
-        
     
     def download(self, url=None, remote_post=None, preview=False):
         """
@@ -520,7 +523,7 @@ class Fantia:
             raise ValueError('either url or remote_post must be passed')
         
         if remote_post is not None:
-            post_id = remote_post.original_id.split('_')[0]
+            post_id = remote_post.original_id.split('-')[0]
             self.log.info('update request for %s', post_id)
             
         else:

@@ -31,8 +31,8 @@ OAUTH_ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
 OAUTH_AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
-TWEET_REGEXP = re.compile('^https?:\/\/twitter.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$')
-TIMELINE_REGEXP = re.compile('^https?:\/\/twitter.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$')
+TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$')
+TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$')
 
 def oauth_start(consumer_key, consumer_secret):
     oauth_client = OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri='oob')
@@ -96,6 +96,7 @@ class TweetIterator:
         self.method = options.method
         self.user = options.user
         
+        self.first_id = None
         self.head_id = self.state.get('head_id')
         self.tail_id = self.state.get('tail_id')
     
@@ -188,7 +189,7 @@ class TweetIterator:
         limit = n
         if direction == FetchDirection.newer:
             if self.tail_id is None:
-                direction == FetchDirection.older
+                direction = FetchDirection.older
             else:
                 limit = None
         
@@ -198,30 +199,32 @@ class TweetIterator:
         first_iteration = True
         for tweet in tweets:
             if first_iteration and (self.head_id is None or direction == FetchDirection.newer):
-                self.head_id = tweet.id_str
-            
-            if direction == FetchDirection.older:
-                self.tail_id = tweet.id_str
+                self.first_id = tweet.id_str
             
             if self._tweet_has_content(tweet):
-                post = self.twitter.tweet_to_remote_post(tweet, preview=self.subscription is None)
-                posts.append(post)
+                remote_post = self.twitter.tweet_to_remote_post(tweet, preview=self.subscription is None)
+                yield remote_post
                 
                 if self.subscription is not None:
-                    self.subscription.feed.append(post)
+                    self.subscription.feed.append(remote_post)
             
                 # always commit changes
                 # RemotePost, RemoteTag and the subscription feed are simply a cache
                 # the file downloads are more expensive than a call to the database
                 self.twitter.core.commit()
             
+            if direction == FetchDirection.older:
+                self.tail_id = tweet.id_str
+            
             first_iteration = False
+        
+        if self.first_id is not None:
+            self.head_id = self.first_id
+            self.first_id = None
         
         self._save_state()
         if self.subscription is not None:
             self.twitter.core.add(self.subscription)
-        
-        return posts
 
 class Twitter:
     name = 'twitter'
@@ -434,14 +437,11 @@ class Twitter:
         
         self.log.info('getting tweet %s', original_id)
         
-        if remote_post is not None:
-            post = remote_post
-        
-        else:
-            post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
-            if post is None:
+        if remote_post is None:
+            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
+            if remote_post is None:
                 self.log.info('creating new post')
-                post = RemotePost(
+                remote_post = RemotePost(
                     source=self.source,
                     original_id=original_id,
                     url=TWEET_FORMAT.format(user=user, tweet_id=original_id),
@@ -452,48 +452,48 @@ class Twitter:
                 )
                 
                 user_tag = self.core.get_remote_tag(TagCategory.artist, user)
-                post.tags.append(user_tag)
+                remote_post.tags.append(user_tag)
                 
                 if tweet.favorited is True:
-                    post.favorite = True
+                    remote_post.favorite = True
                 
                 if tweet.possibly_sensitive:
                     nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
-                    post.tags.append(nsfw_tag)
+                    remote_post.tags.append(nsfw_tag)
                 
                 if tweet.hashtags is not None:
                     for hashtag in tweet.hashtags:
                         tag = hashtag.text
                         nsfw_tag = self.core.get_remote_tag(TagCategory.general, tag)
-                        post.tags.append(nsfw_tag)
+                        remote_post.tags.append(nsfw_tag)
                 
                 if tweet.in_reply_to_status_id is not None:
                     url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
-                    post.related.append(Related(url=url))
+                    remote_post.related.append(Related(url=url))
                 
                 if tweet.urls is not None:
                     for url in tweet.urls:
                         # the unwound section is a premium feature
                         self.log.info('found url %s', url.url)
                         final_url = unwind_url(url.url)
-                        post.related.append(Related(url=final_url))
+                        remote_post.related.append(Related(url=final_url))
                 
-                self.core.add(post)
+                self.core.add(remote_post)
                 
             else:
-                self.log.info('post already exists: %s', post.id)
+                self.log.info('post already exists: %s', remote_post.id)
         
         if tweet.media is not None:
             available = set(range(len(tweet.media)))
-            present = set(file.remote_order for file in post.files)
+            present = set(file.remote_order for file in remote_post.files)
             
             for order in available - present:
-                file = File(remote=post, remote_order=order)
+                file = File(remote=remote_post, remote_order=order)
                 self.core.add(file)
                 self.core.flush()
-                self.log.info('found new file for post %s, file order: %s', post.id, order)
+                self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
             
-            for file in post.files:
+            for file in remote_post.files:
                 need_thumb = not file.thumb_present
                 need_file = not file.present and not preview
                 
@@ -502,7 +502,7 @@ class Twitter:
                     thumb, orig = self._download_media(tweet.media[file.remote_order], thumbnail=need_thumb, file=need_file)
                     self.core.import_file(file, orig=orig, thumb=thumb, move=True)
         
-        return post
+        return remote_post
     
     def download(self, url=None, remote_post=None, preview=False):
         """
