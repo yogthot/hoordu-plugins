@@ -17,60 +17,78 @@ from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
 
+CREATOR_ID_GET_URL = 'https://www.pixiv.net/fanbox/creator/{pixiv_id}'
+CREATOR_GET_URL = 'https://api.fanbox.cc/creator.get?creatorId={creator}'
+CREATOR_URL_REGEXP = re.compile('https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/', flags=re.IGNORECASE)
+
 POST_FORMAT = 'https://fanbox.cc/@/posts/{post_id}'
 POST_REGEXP = [
-    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$'),
-    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]*)\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$')
+    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
+    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]*)\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 CREATOR_REGEXP = [
-    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/(?:\/.*)?(?:\?.*)?(?:#.*)?$'),
-    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]+)(?:\/.*)?(?:\?.*)?(?:#.*)?$')
+    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
+    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]+)(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 
 POST_GET_URL = 'https://api.fanbox.cc/post.info?postId={post_id}'
 CREATOR_POSTS_URL = 'https://api.fanbox.cc/post.listCreator'
 PAGE_LIMIT = 10
 
-class CreatorIterator:
+class CreatorIterator(BaseIterator):
     def __init__(self, fanbox, subscription=None, options=None):
-        self.fanbox = fanbox
+        super().__init__(fanbox, subscription=subscription, options=options)
+        
         self.http = fanbox.http
         self.log = fanbox.log
-        self.subscription = subscription
         
-        if self.subscription is not None:
-            options = hoordu.Dynamic.from_json(self.subscription.options)
-            self.state = hoordu.Dynamic.from_json(self.subscription.state)
-        else:
-            self.state = hoordu.Dynamic()
-        
-        self.creator = options.creator
+        self.options.pixiv_id = self.options.get('pixiv_id')
         
         self.first_id = None
-        self.head_id = self.state.get('head_id')
-        self.tail_id = self.state.get('tail_id')
-        self.tail_datetime = self.state.get('tail_datetime')
+        self.state.head_id = self.state.get('head_id')
+        self.state.tail_id = self.state.get('tail_id')
+        self.state.tail_datetime = self.state.get('tail_datetime')
     
-    def _save_state(self):
-        self.state.head_id = self.head_id
-        self.state.tail_id = self.tail_id
-        self.state.tail_datetime = self.tail_datetime
-        if self.subscription is not None:
-            self.subscription.state = self.state.to_json()
+    def init(self):
+        update = False
+        
+        if self.options.pixiv_id is not None:
+            response = self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=self.options.pixiv_id), allow_redirects=False)
+            creator_url = response.headers['Location']
+            
+            match = CREATOR_URL_REGEXP.match(creator_url)
+            creator = match.group('creator')
+            
+            if creator and self.options.creator != creator:
+                self.options.creator = self.options.creator = creator
+                update = True
+            
+        else:
+            response = self.http.get(CREATOR_GET_URL.format(creator=self.options.creator))
+            response.raise_for_status()
+            creator = hoordu.Dynamic.from_json(response.text).body
+            
+            self.options.pixiv_id = creator.user.userId
+            update = True
+        
+        if update and self.subscription is not None:
+            self.subscription.options = self.options.to_json()
+            self.plugin.core.add(self.subscription)
     
     def _post_iterator(self, direction=FetchDirection.newer, n=None):
         head = (direction == FetchDirection.newer)
         
-        page_size = PAGE_LIMIT if n is None else min(n, PAGE_LIMIT)
-        min_id = int(self.head_id) if head and self.head_id is not None else None
-        max_id = self.tail_id if not head else None
-        max_datetime = self.tail_datetime if not head else None
+        min_id = int(self.state.head_id) if head and self.state.head_id is not None else None
+        max_id = self.state.tail_id if not head else None
+        max_datetime = self.state.tail_datetime if not head else None
         
         total = 0
         first_iteration = True
         while True:
+            page_size = PAGE_LIMIT if n is None else min(n - total, PAGE_LIMIT)
+            
             params = {
-                'creatorId': self.creator,
+                'creatorId': self.options.creator,
                 'limit': page_size
             }
             
@@ -89,7 +107,7 @@ class CreatorIterator:
             if len(posts) == 0:
                 return
             
-            if first_iteration and (self.head_id is None or direction == FetchDirection.newer):
+            if first_iteration and (self.state.head_id is None or direction == FetchDirection.newer):
                 self.first_id = posts[0].id
             
             for post in posts:
@@ -105,8 +123,8 @@ class CreatorIterator:
                 max_datetime = post.publishedDatetime
                 
                 if direction == FetchDirection.older:
-                    self.tail_id = post.id
-                    self.tail_datetime = post.publishedDatetime
+                    self.state.tail_id = post.id
+                    self.state.tail_datetime = post.publishedDatetime
                 
                 total += 1
                 if n is not None and total >= n:
@@ -118,48 +136,33 @@ class CreatorIterator:
             first_iteration = False
     
     def fetch(self, direction=FetchDirection.newer, n=None):
-        """
-        Try to get at least `n` newer or older posts from this search
-        depending on the direction.
-        Create a RemotePost entry and any associated Files for each post found,
-        thumbnails should be downloaded, files are optional.
-        Posts should always come ordered in the same way.
-        
-        Returns a list of the new RemotePost objects.
-        """
-        
-        # TODO store the user id and use it in subsequent updates
-        # https://www.pixiv.net/fanbox/creator/{pixiv_id}
-        
         if direction == FetchDirection.newer:
-            if self.tail_id is None:
+            if self.state.tail_id is None:
                 direction = FetchDirection.older
             else:
                 n = None
         
         for post in self._post_iterator(direction, n):
-            remote_post = self.fanbox._to_remote_post(post, preview=self.subscription is None)
+            remote_post = self.plugin._to_remote_post(post, preview=self.subscription is None)
             yield remote_post
             
             if self.subscription is not None:
                 self.subscription.feed.append(remote_post)
             
-            # always commit changes
-            # RemotePost, RemoteTag and the subscription feed are simply a cache
-            # the file downloads are more expensive than a call to the database
-            self.fanbox.core.commit()
+            self.plugin.core.commit()
         
         if self.first_id is not None:
-            self.head_id = self.first_id
+            self.state.head_id = self.first_id
             self.first_id = None
         
-        self._save_state()
         if self.subscription is not None:
-            self.fanbox.core.add(self.subscription)
+            self.subscription.state = self.state.to_json()
+            self.plugin.core.add(self.subscription)
 
-class Fanbox:
+class Fanbox(BasePlugin):
     name = 'fanbox'
     version = 1
+    iterator = CreatorIterator
     
     @classmethod
     def config_form(cls):
@@ -170,8 +173,6 @@ class Fanbox:
     @classmethod
     def init(cls, core, parameters=None):
         source = core.source
-        
-        cls.update(core)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -204,20 +205,9 @@ class Fanbox:
             core.add(source)
     
     def __init__(self, core, config=None):
-        self.core = core
-        self.source = core.source
-        self.log = core.logger
-        self.session = core.session
-        
-        if config is None:
-            config = hoordu.Dynamic.from_json(self.source.config)
-        
-        self._load_config(config)
+        super().__init__(core, config)
         
         self._init_api()
-    
-    def _load_config(self, config):
-        self.FANBOXSESSID = config.FANBOXSESSID
     
     def _init_api(self):
         self.http = requests.Session()
@@ -228,19 +218,10 @@ class Fanbox:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
         })
         
-        cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.FANBOXSESSID)
+        cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.config.FANBOXSESSID)
         self.http.cookies.set_cookie(cookie)
     
     def parse_url(self, url):
-        """
-        Checks if an url can be downloaded by this plugin.
-        
-        Returns the remote id if the url corresponds to a single post,
-        a Dynamic object that can be passed to search if the url
-        corresponds to multiple posts, or None if this plugin can't
-        download or create a search with this url.
-        """
-        
         if url.isdigit():
             return url
         
@@ -256,7 +237,7 @@ class Fanbox:
                     'creator': match.group('creator')
                 })
         
-        return post_id
+        return None
     
     def _download_file(self, url, filename=None):
         # TODO file downloads should be managed by hoordu
@@ -318,11 +299,9 @@ class Fanbox:
                 # creators are identified by their pixiv id because their name and creatorId can change
                 creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
-                metadata = hoordu.Dynamic.from_json(creator_tag.metadata_)
-                if metadata.get('name', None) != creator_name or metadata.get('slug', None) != creator_slug:
-                    metadata.name = creator_name
-                    metadata.slug = creator_name
-                    creator_tag.metadata_ = metadata.to_json()
+                
+                if any((creator_tag.update_metadata('name', creator_name),
+                        creator_tag.update_metadata('slug', creator_slug))):
                     self.core.add(creator_tag)
                 
                 for tag in post.tags:
@@ -487,9 +466,12 @@ class Fanbox:
                     if embed.serviceProvider == 'fanbox':
                         related_post_id = embed.contentId.split('/')[-1]
                         url = POST_FORMAT.format(post_id=related_post_id)
-                    
+                        
+                    elif embed.serviceProvider == 'google_forms':
+                        url = 'https://docs.google.com/forms/d/e/{}/viewform'.format(embed.contentId)
+                        
                     else:
-                        raise ValueError('unknown embed service provider: {}'.format(embed.serviceProvider))
+                        raise NotImplementedError('unknown embed service provider: {}'.format(embed.serviceProvider))
                     
                     remote_post.related.append(Related(url=url))
                     
@@ -511,23 +493,11 @@ class Fanbox:
             self.core.add(remote_post)
             
         else:
-            raise ValueError('unknown post type: {}'.format(post.type))
+            raise NotImplementedError('unknown post type: {}'.format(post.type))
         
         return remote_post
     
     def download(self, url=None, remote_post=None, preview=False):
-        """
-        Creates or updates a RemotePost entry along with all the associated Files,
-        and downloads all files and thumbnails that aren't present yet.
-        
-        If remote_post is passed, its original_id will be used and it will be
-        updated in place.
-        
-        If preview is set to True, then only the thumbnails are downloaded.
-        
-        Returns the downloaded RemotePost object.
-        """
-        
         if url is None and remote_post is None:
             raise ValueError('either url or remote_post must be passed')
         
@@ -566,54 +536,6 @@ class Fanbox:
         return Form('{} search'.format(self.name),
             ('creator', Input('creator', [validators.required()]))
         )
-    
-    def search(self, options):
-        """
-        Creates a temporary search for a given set of search options.
-        
-        Returns a post iterator object.
-        """
-        
-        return CreatorIterator(self, options=options)
-    
-    def create_subscription(self, name, options=None, iterator=None):
-        """
-        Creates a Subscription entry for the given search options identified by the given name,
-        should not get any posts from the post source.
-        """
-        
-        if iterator is not None:
-            options = hoordu.Dynamic({
-                'creator': iterator.creator
-            })
-            state = iterator.state
-            
-        elif options is not None:
-            state = hoordu.Dynamic()
-        
-        sub = Subscription(
-            source=self.source,
-            name=name,
-            options=options.to_json(),
-            state=state.to_json()
-        )
-        
-        self.core.add(sub)
-        self.core.flush()
-        
-        if iterator is not None:
-            iterator.subscription = sub
-        
-        return sub
-    
-    def get_iterator(self, subscription):
-        """
-        Gets the post iterator for a specific subscription.
-        
-        Returns a post iterator object.
-        """
-        
-        return CreatorIterator(self, subscription=subscription)
 
 Plugin = Fanbox
 

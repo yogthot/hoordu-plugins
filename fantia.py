@@ -17,40 +17,26 @@ from hoordu.plugins import *
 from hoordu.forms import *
 
 POST_FORMAT = 'https://fantia.jp/posts/{post_id}'
-POST_REGEXP = re.compile('^https?:\/\/fantia\.jp\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$')
-FANCLUB_REGEXP = re.compile('^https?:\/\/fantia\.jp\/fanclubs\/(?P<fanclub_id>\d+)(?:\/.*)?(?:\?.*)?(?:#.*)?$')
+POST_REGEXP = re.compile('^https?:\/\/fantia\.jp\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
+FANCLUB_REGEXP = re.compile('^https?:\/\/fantia\.jp\/fanclubs\/(?P<fanclub_id>\d+)(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 FILENAME_REGEXP = re.compile('^[a-z0-9]+-(?P<filename>.+)$')
 
 POST_GET_URL = 'https://fantia.jp/api/v1/posts/{post_id}'
 FANCLUB_GET_URL = 'https://fantia.jp/api/v1/fanclubs/{fanclub_id}'
 FILE_DOWNLOAD_URL = 'https://fantia.jp{download_uri}'
 
-class CreatorIterator:
+class CreatorIterator(BaseIterator):
     def __init__(self, fantia, subscription=None, options=None):
-        self.fantia = fantia
+        super().__init__(fantia, subscription=subscription, options=options)
+        
         self.http = fantia.http
         self.log = fantia.log
-        self.subscription = subscription
         
-        if self.subscription is not None:
-            options = hoordu.Dynamic.from_json(self.subscription.options)
-            self.state = hoordu.Dynamic.from_json(self.subscription.state)
-        else:
-            self.state = hoordu.Dynamic()
-        
-        self.creator_id = options.creator_id
-        
-        self.head_id = self.state.get('head_id')
-        self.tail_id = self.state.get('tail_id')
-    
-    def _save_state(self):
-        self.state.head_id = self.head_id
-        self.state.tail_id = self.tail_id
-        if self.subscription is not None:
-            self.subscription.state = self.state.to_json()
+        self.state.head_id = self.state.get('head_id')
+        self.state.tail_id = self.state.get('tail_id')
     
     def _post_iterator(self, direction=FetchDirection.newer, n=None):
-        post_id = self.head_id if direction == FetchDirection.newer else self.tail_id
+        post_id = self.state.head_id if direction == FetchDirection.newer else self.state.tail_id
         
         if post_id is None:
             response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.creator_id))
@@ -61,8 +47,8 @@ class CreatorIterator:
                 return
             
             post_id = fanclub.recent_posts[0].id
-            self.head_id = post_id
-            self.tail_id = post_id
+            self.state.head_id = post_id
+            self.state.tail_id = post_id
             
         else:
             # TODO the post might have been deleted
@@ -78,6 +64,7 @@ class CreatorIterator:
             
             post_id = next_post.id
         
+        # iter(int, 1) -> infinite iterator
         it = range(n) if n is not None else iter(int, 1)
         for _ in it:
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
@@ -88,9 +75,9 @@ class CreatorIterator:
             yield post
             
             if direction == FetchDirection.newer:
-                self.head_id = post_id
+                self.state.head_id = post_id
             elif direction == FetchDirection.older:
-                self.tail_id = post_id
+                self.state.tail_id = post_id
             
             next_post = post.links.next if direction == FetchDirection.newer else post.links.previous
             if next_post is None:
@@ -99,21 +86,11 @@ class CreatorIterator:
             post_id = next_post.id
     
     def fetch(self, direction=FetchDirection.newer, n=None):
-        """
-        Try to get at least `n` newer or older posts from this search
-        depending on the direction.
-        Create a RemotePost entry and any associated Files for each post found,
-        thumbnails should be downloaded, files are optional.
-        Posts should always come ordered in the same way.
-        
-        Returns a list of the new RemotePost objects.
-        """
-        
-        if self.tail_id is None:
+        if self.state.tail_id is None:
             direction = FetchDirection.older
         
         for post in self._post_iterator(direction, n):
-            remote_posts = self.fantia._to_remote_posts(post, preview=self.subscription is None)
+            remote_posts = self.plugin._to_remote_posts(post, preview=self.subscription is None)
             for remote_post in remote_posts:
                 yield remote_post
             
@@ -121,18 +98,16 @@ class CreatorIterator:
                 for p in remote_posts:
                     self.subscription.feed.append(p)
             
-            # always commit changes
-            # RemotePost, RemoteTag and the subscription feed are simply a cache
-            # the file downloads are more expensive than a call to the database
-            self.fantia.core.commit()
+            self.plugin.core.commit()
         
-        self._save_state()
         if self.subscription is not None:
-            self.fantia.core.add(self.subscription)
+            self.subscription.state = self.state.to_json()
+            self.plugin.core.add(self.subscription)
 
-class Fantia:
+class Fantia(BasePlugin):
     name = 'fantia'
     version = 1
+    iterator = CreatorIterator
     
     @classmethod
     def config_form(cls):
@@ -143,8 +118,6 @@ class Fantia:
     @classmethod
     def init(cls, core, parameters=None):
         source = core.source
-        
-        cls.update(core)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -177,20 +150,9 @@ class Fantia:
             core.add(source)
     
     def __init__(self, core, config=None):
-        self.core = core
-        self.source = core.source
-        self.log = core.logger
-        self.session = core.session
-        
-        if config is None:
-            config = hoordu.Dynamic.from_json(self.source.config)
-        
-        self._load_config(config)
+        super().__init__(core, config)
         
         self._init_api()
-    
-    def _load_config(self, config):
-        self.session_id = config.session_id
     
     def _init_api(self):
         self.http = requests.Session()
@@ -201,19 +163,10 @@ class Fantia:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
         })
         
-        cookie = requests.cookies.create_cookie(name='_session_id', value=self.session_id)
+        cookie = requests.cookies.create_cookie(name='_session_id', value=self.config.session_id)
         self.http.cookies.set_cookie(cookie)
     
     def parse_url(self, url):
-        """
-        Checks if an url can be downloaded by this plugin.
-        
-        Returns the remote id if the url corresponds to a single post,
-        a Dynamic object that can be passed to search if the url
-        corresponds to multiple posts, or None if this plugin can't
-        download or create a search with this url.
-        """
-        
         if url.isdigit():
             return url
         
@@ -227,7 +180,7 @@ class Fantia:
                 'creator_id': match.group('fanclub_id')
             })
         
-        return post_id
+        return None
     
     def _download_file(self, url, filename=None):
         # TODO file downloads should be managed by hoordu
@@ -289,10 +242,8 @@ class Fantia:
                 # creators are identified by their id because their name can change
                 creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
-                metadata = hoordu.Dynamic.from_json(creator_tag.metadata_)
-                if metadata.get('name', None) != creator_name:
-                    metadata.name = creator_name
-                    creator_tag.metadata_ = metadata.to_json()
+                
+                if creator_tag.update_metadata('name', creator_name):
                     self.core.add(creator_tag)
                 
                 for tag in post.tags:
@@ -410,7 +361,7 @@ class Fantia:
             self.core.add(remote_post)
             
         else:
-            raise ValueError('unknown content category: {}'.format(content.category))
+            raise NotImplementedError('unknown content category: {}'.format(content.category))
         
         return remote_post
     
@@ -456,10 +407,8 @@ class Fantia:
                 # creators are identified by their id because their name can change
                 creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
-                metadata = hoordu.Dynamic.from_json(creator_tag.metadata_)
-                if metadata.get('name', None) != creator_name:
-                    metadata.name = creator_name
-                    creator_tag.metadata_ = metadata.to_json()
+                
+                if creator_tag.update_metadata('name', creator_name):
                     self.core.add(creator_tag)
                 
                 for tag in post.tags:
@@ -507,18 +456,6 @@ class Fantia:
         return remote_posts
     
     def download(self, url=None, remote_post=None, preview=False):
-        """
-        Creates or updates a RemotePost entry along with all the associated Files,
-        and downloads all files and thumbnails that aren't present yet.
-        
-        If remote_post is passed, its original_id will be used and it will be
-        updated in place.
-        
-        If preview is set to True, then only the thumbnails are downloaded.
-        
-        Returns the downloaded RemotePost object.
-        """
-        
         if url is None and remote_post is None:
             raise ValueError('either url or remote_post must be passed')
         
@@ -553,54 +490,6 @@ class Fantia:
         return Form('{} search'.format(self.name),
             ('creator_id', Input('fanclub id', [validators.required()]))
         )
-    
-    def search(self, options):
-        """
-        Creates a temporary search for a given set of search options.
-        
-        Returns a post iterator object.
-        """
-        
-        return CreatorIterator(self, options=options)
-    
-    def create_subscription(self, name, options=None, iterator=None):
-        """
-        Creates a Subscription entry for the given search options identified by the given name,
-        should not get any posts from the post source.
-        """
-        
-        if iterator is not None:
-            options = hoordu.Dynamic({
-                'creator_id': iterator.creator_id
-            })
-            state = iterator.state
-            
-        elif options is not None:
-            state = hoordu.Dynamic()
-        
-        sub = Subscription(
-            source=self.source,
-            name=name,
-            options=options.to_json(),
-            state=state.to_json()
-        )
-        
-        self.core.add(sub)
-        self.core.flush()
-        
-        if iterator is not None:
-            iterator.subscription = sub
-        
-        return sub
-    
-    def get_iterator(self, subscription):
-        """
-        Gets the post iterator for a specific subscription.
-        
-        Returns a post iterator object.
-        """
-        
-        return CreatorIterator(self, subscription=subscription)
 
 Plugin = Fantia
 

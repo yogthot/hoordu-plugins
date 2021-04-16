@@ -31,8 +31,10 @@ OAUTH_ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
 OAUTH_AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
-TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$')
-TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$')
+TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
+TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$', flags=re.IGNORECASE)
+
+MEDIA_URL = '{base_url}?format={ext}&name={size}'
 
 def oauth_start(consumer_key, consumer_secret):
     oauth_client = OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri='oob')
@@ -54,7 +56,7 @@ def oauth_finish(consumer_key, consumer_secret, oauth_token, oauth_token_secret,
     try:
         resp = oauth_client.fetch_access_token(OAUTH_ACCESS_TOKEN_URL)
     except ValueError as e:
-        raise ValueError('Invalid response from Twitter requesting temp token') from e
+        raise APIError('invalid response from Twitter when requesting temp token') from e
         
     access_token_key = resp.get('oauth_token')
     access_token_secret = resp.get('oauth_token_secret')
@@ -77,34 +79,28 @@ def unwind_url(url):
     
     return final_url
 
-class TweetIterator:
+class TweetIterator(BaseIterator):
     def __init__(self, twitter, subscription=None, options=None):
-        self.twitter = twitter
+        super().__init__(twitter, subscription=subscription, options=options)
+        
         self.api = twitter.api
         self.log = twitter.log
-        self.subscription = subscription
         
-        if self.subscription is not None:
-            options = hoordu.Dynamic.from_json(self.subscription.options)
-            self.state = hoordu.Dynamic.from_json(self.subscription.state)
-        else:
-            self.state = hoordu.Dynamic()
-        
-        if options is None or not options.defined('method', 'user'):
-            raise ValueError('search options are invalid: {}'.format(repr(options)))
-        
-        self.method = options.method
-        self.user = options.user
+        self.options.user_id = self.options.get('user_id')
         
         self.first_id = None
-        self.head_id = self.state.get('head_id')
-        self.tail_id = self.state.get('tail_id')
+        self.state.head_id = self.state.get('head_id')
+        self.state.tail_id = self.state.get('tail_id')
     
-    def _save_state(self):
-        self.state.head_id = self.head_id
-        self.state.tail_id = self.tail_id
-        if self.subscription is not None:
-            self.subscription.state = self.state.to_json()
+    def init(self):
+        if self.options.user_id is None:
+            user = self.api.GetUser(screen_name=self.options.user)
+            
+            self.options.user_id = user.id_str
+            
+            if self.subscription is not None:
+                self.subscription.options = self.options.to_json()
+                self.twitter.core.add(self.subscription)
     
     def _page_iterator(self, method, limit=None, max_id=None, **kwargs):
         total = 0
@@ -127,34 +123,34 @@ class TweetIterator:
         head = (direction == FetchDirection.newer)
         
         page_size = PAGE_LIMIT if limit is None else min(limit, PAGE_LIMIT)
-        since_id = self.head_id if head else None
-        max_id = self.tail_id if not head else None
+        since_id = self.state.head_id if head else None
+        max_id = self.state.tail_id if not head else None
         
         # max_id: Returns results with an ID less than (that is, older than) or equal to the specified ID.
         if max_id is not None:
             max_id = int(max_id) - 1
         
-        if self.method == 'tweets':
+        if self.options.method == 'tweets':
             tweets = self._page_iterator(
                 self.api.GetUserTimeline,
                 limit=limit,
-                screen_name=self.user, count=page_size, exclude_replies=False, include_rts=False,
+                user_id=self.options.user_id, count=page_size, exclude_replies=False, include_rts=False,
                 max_id=max_id, since_id=since_id
             )
             
-        elif self.method == 'retweets':
+        elif self.options.method == 'retweets':
             tweets = self._page_iterator(
                 self.api.GetUserTimeline,
                 limit=limit,
-                screen_name=self.user, count=page_size, exclude_replies=False, include_rts=True,
+                user_id=self.options.user_id, count=page_size, exclude_replies=False, include_rts=True,
                 max_id=max_id, since_id=since_id
             )
             
-        elif self.method == 'likes':
+        elif self.options.method == 'likes':
             tweets = self._page_iterator(
                 self.api.GetFavorites,
                 limit=limit,
-                screen_name=self.user, count=page_size,
+                user_id=self.options.user_id, count=page_size,
                 max_id=max_id, since_id=since_id
             )
         
@@ -176,59 +172,46 @@ class TweetIterator:
         ))
     
     def fetch(self, direction=FetchDirection.newer, n=None):
-        """
-        Try to get at least `n` newer or older posts from this search
-        depending on the direction.
-        Create a RemotePost entry and any associated Files for each post found,
-        thumbnails should be downloaded, files are optional.
-        Posts should always come ordered in the same way.
-        
-        Returns a list of the new RemotePost objects.
-        """
-        
         limit = n
         if direction == FetchDirection.newer:
-            if self.tail_id is None:
+            if self.state.tail_id is None:
                 direction = FetchDirection.older
             else:
                 limit = None
         
         tweets = self._feed_iterator(direction, limit=limit)
         
-        posts = []
         first_iteration = True
         for tweet in tweets:
-            if first_iteration and (self.head_id is None or direction == FetchDirection.newer):
+            if first_iteration and (self.state.head_id is None or direction == FetchDirection.newer):
                 self.first_id = tweet.id_str
             
             if self._tweet_has_content(tweet):
-                remote_post = self.twitter.tweet_to_remote_post(tweet, preview=self.subscription is None)
+                remote_post = self.plugin.tweet_to_remote_post(tweet, preview=self.subscription is None)
                 yield remote_post
                 
                 if self.subscription is not None:
                     self.subscription.feed.append(remote_post)
-            
-                # always commit changes
-                # RemotePost, RemoteTag and the subscription feed are simply a cache
-                # the file downloads are more expensive than a call to the database
-                self.twitter.core.commit()
+                
+                self.plugin.core.commit()
             
             if direction == FetchDirection.older:
-                self.tail_id = tweet.id_str
+                self.state.tail_id = tweet.id_str
             
             first_iteration = False
         
         if self.first_id is not None:
-            self.head_id = self.first_id
+            self.state.head_id = self.first_id
             self.first_id = None
         
-        self._save_state()
         if self.subscription is not None:
-            self.twitter.core.add(self.subscription)
+            self.subscription.state = self.state.to_json()
+            self.plugin.core.add(self.subscription)
 
-class Twitter:
+class Twitter(BasePlugin):
     name = 'twitter'
     version = 3
+    iterator = TweetIterator
     
     @classmethod
     def config_form(cls):
@@ -242,8 +225,6 @@ class Twitter:
     @classmethod
     def init(cls, core, parameters=None):
         source = core.source
-        
-        cls.update(core)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -312,44 +293,20 @@ class Twitter:
             core.add(source)
     
     def __init__(self, core, config=None):
-        self.core = core
-        self.source = core.source
-        self.log = core.logger
-        self.session = core.session
-        
-        if config is None:
-            config = hoordu.Dynamic.from_json(self.source.config)
-        
-        self._load_config(config)
+        super().__init__(core, config)
         
         self._init_api()
     
-    def _load_config(self, config):
-        self.consumer_key = config.consumer_key
-        self.consumer_secret = config.consumer_secret
-        
-        self.access_token_key = config.get('access_token_key', None)
-        self.access_token_secret = config.get('access_token_secret', None)
-    
     def _init_api(self):
         self.api = twitter.Api(
-            consumer_key=self.consumer_key,
-            consumer_secret=self.consumer_secret,
-            access_token_key=self.access_token_key,
-            access_token_secret=self.access_token_secret,
+            consumer_key=self.config.consumer_key,
+            consumer_secret=self.config.consumer_secret,
+            access_token_key=self.config.get('access_token_key', None),
+            access_token_secret=self.config.get('access_token_secret', None),
             tweet_mode='extended'
         )
     
     def parse_url(self, url):
-        """
-        Checks if an url can be downloaded by this plugin.
-        
-        Returns the remote id if the url corresponds to a single post,
-        a Dynamic object that can be passed to search if the url
-        corresponds to multiple posts, or None if this plugin can't
-        download or create a search with this url.
-        """
-        
         if url.isdigit():
             return url
         
@@ -372,15 +329,19 @@ class Twitter:
         
         return None
     
-    def _download_file(self, url):
+    def _download_file(self, url, filename=None):
         # TODO file downloads should be managed by hoordu
         # so that rate limiting and a download manager can be
         # implemented easily and in a centralized way
         self.log.debug('downloading %s', url)
         
-        suffix = os.path.splitext(urlparse(url).path)[-1].split(':')[0]
-        if not suffix.startswith('.'):
-            suffix = ''
+        if filename is not None:
+            suffix = '-{}'.format(filename)
+            
+        else:
+            suffix = os.path.splitext(urlparse(url).path)[-1]
+            if not suffix.startswith('.'):
+                suffix = ''
         
         fd, path = mkstemp(suffix=suffix)
         
@@ -409,16 +370,19 @@ class Twitter:
         thumb = None
         orig = None
         
+        base_url, ext = media.media_url.rsplit('.', 1)
+        filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
+        
         if media.type == 'photo':
             if thumbnail:
-                thumb = self._download_file('{}:{}'.format(media.media_url, THUMB_SIZE))
+                thumb = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=THUMB_SIZE), filename)
             
             if file:
-                orig = self._download_file('{}:{}'.format(media.media_url, ORIG_SIZE))
+                orig = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=ORIG_SIZE), filename)
             
         elif media.type == 'video' or media.type == 'animated_gif':
             if thumbnail:
-                thumb = self._download_file('{}:{}'.format(media.media_url, THUMB_SIZE))
+                thumb = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=THUMB_SIZE), filename)
             
             if file:
                 orig = self._download_video(media)
@@ -432,6 +396,7 @@ class Twitter:
         
         original_id = tweet.id_str
         user = tweet.user.screen_name
+        user_id = tweet.user.id_str
         text = tweet.full_text
         post_time = datetime.utcfromtimestamp(tweet.created_at_in_seconds)
         
@@ -451,8 +416,11 @@ class Twitter:
                     metadata_=json.dumps({'user': user})
                 )
                 
-                user_tag = self.core.get_remote_tag(TagCategory.artist, user)
+                user_tag = self.core.get_remote_tag(TagCategory.artist, user_id)
                 remote_post.tags.append(user_tag)
+                
+                if user_tag.update_metadata('user', user):
+                    self.core.add(user_tag)
                 
                 if tweet.favorited is True:
                     remote_post.favorite = True
@@ -505,18 +473,6 @@ class Twitter:
         return remote_post
     
     def download(self, url=None, remote_post=None, preview=False):
-        """
-        Creates or updates a RemotePost entry along with all the associated Files,
-        and downloads all files and thumbnails that aren't present yet.
-        
-        If remote_post is passed, its original_id will be used and it will be
-        updated in place.
-        
-        If preview is set to True, then only the thumbnails are downloaded.
-        
-        Returns the downloaded RemotePost object.
-        """
-        
         if url is None and remote_post is None:
             raise ValueError('either url or remote_post must be passed')
         
@@ -550,55 +506,6 @@ class Twitter:
                 ], [validators.required()])),
             ('user', Input('screen name', [validators.required()]))
         )
-    
-    def search(self, options):
-        """
-        Creates a temporary search for a given set of search options.
-        
-        Returns a post iterator object.
-        """
-        
-        return TweetIterator(self, options=options)
-    
-    def create_subscription(self, name, options=None, iterator=None):
-        """
-        Creates a Subscription entry for the given search options identified by the given name,
-        should not get any posts from the post source.
-        """
-        
-        if iterator is not None:
-            options = hoordu.Dynamic({
-                'method': iterator.method,
-                'user': iterator.user
-            })
-            state = iterator.state
-            
-        elif options is not None:
-            state = hoordu.Dynamic()
-        
-        sub = Subscription(
-            source=self.source,
-            name=name,
-            options=options.to_json(),
-            state=state.to_json()
-        )
-        
-        self.core.add(sub)
-        self.core.flush()
-        
-        if iterator is not None:
-            iterator.subscription = sub
-        
-        return sub
-    
-    def get_iterator(self, subscription):
-        """
-        Gets the post iterator for a specific subscription.
-        
-        Returns a post iterator object.
-        """
-        
-        return TweetIterator(self, subscription=subscription)
 
 Plugin = Twitter
 
