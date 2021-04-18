@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 
-# these options are appended to the end of image urls when downloading
-THUMB_SIZE = 'small'
-ORIG_SIZE = 'orig'
-
-PAGE_LIMIT = 200
-
-
 import os
 import re
 import json
@@ -18,13 +11,13 @@ import functools
 import urllib3
 http = urllib3.PoolManager()
 
+from requests_oauthlib import OAuth1Session
+import twitter
+
 import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
-
-from requests_oauthlib import OAuth1Session
-import twitter
 
 OAUTH_REQUEST_TOKEN_URL = 'https://api.twitter.com/oauth/request_token'
 OAUTH_ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
@@ -34,7 +27,17 @@ TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
 TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
 TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$', flags=re.IGNORECASE)
 
+URL_REGEXP = re.compile('https?://\S+')
+PROFILE_IMAGE_REGEXP = re.compile('^(?P<base>.+_)(?P<size>[^\.]+)(?P<ext>.+)$')
+
 MEDIA_URL = '{base_url}?format={ext}&name={size}'
+
+# these options are appended to the end of image urls when downloading
+THUMB_SIZE = 'small'
+ORIG_SIZE = 'orig'
+PROFILE_THUMB_SIZE = '200x200'
+
+PAGE_LIMIT = 200
 
 def oauth_start(consumer_key, consumer_secret):
     oauth_client = OAuth1Session(consumer_key, client_secret=consumer_secret, callback_uri='oob')
@@ -505,6 +508,36 @@ class Twitter(BasePlugin):
                     ('likes', 'likes')
                 ], [validators.required()])),
             ('user', Input('screen name', [validators.required()]))
+        )
+    
+    def get_search_details(self, options):
+        user_id = options.get('user_id')
+        kwargs = {'user_id': user_id} if user_id else {'screen_name': options.user} 
+        
+        user = self.api.GetUser(**kwargs)
+        options.user_id = user.id_str
+        
+        related_urls = []
+        if user.url is not None:
+            related_urls.append(unwind_url(user.url))
+        
+        if user.description is not None:
+            for url in re.findall(URL_REGEXP, user.description):
+                related_urls.append(unwind_url(url))
+        
+        thumb_url = user.profile_image_url
+        match = PROFILE_IMAGE_REGEXP.match(user.profile_image_url)
+        if match:
+            thumb_url = match.group('base') + PROFILE_THUMB_SIZE + match.group('ext')
+        
+        PROFILE_THUMB_SIZE
+        
+        return SearchDetails(
+            hint=user.screen_name,
+            title=user.name,
+            description=user.description,
+            thumbnail_url=thumb_url,
+            related_urls=related_urls
         )
 
 Plugin = Twitter

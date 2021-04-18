@@ -10,7 +10,10 @@ import shutil
 from urllib.parse import urlparse, parse_qs
 import itertools
 import functools
+from xml.sax.saxutils import unescape
+
 import requests
+from bs4 import BeautifulSoup
 
 import hoordu
 from hoordu.models import *
@@ -19,6 +22,7 @@ from hoordu.forms import *
 
 
 POST_FORMAT = 'https://www.pixiv.net/artworks/{post_id}'
+FANBOX_URL_FORMAT = 'https://www.pixiv.net/fanbox/creator/{user_id}'
 POST_REGEXP = [
     re.compile('^(?P<post_id>\d+)_p\d+\.[a-zA-Z0-9]+$'),
     re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?artworks\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
@@ -30,6 +34,7 @@ BOOKMARKS_REGEXP = [
     re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)\/bookmarks\/artworks(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 
+USER_URL = 'https://www.pixiv.net/en/users/{user_id}'
 POST_GET_URL = 'https://www.pixiv.net/ajax/illust/{post_id}'
 POST_PAGES_URL = 'https://www.pixiv.net/ajax/illust/{post_id}/pages'
 POST_UGOIRA_URL = 'https://www.pixiv.net/ajax/illust/{post_id}/ugoira_meta'
@@ -521,6 +526,37 @@ class Pixiv(BasePlugin):
                     ('bookmarks', 'bookmarks')
                 ], [validators.required()])),
             ('user_id', Input('user id', [validators.required()]))
+        )
+    
+    def get_search_details(self, options):
+        response = self.http.get(USER_URL.format(user_id=options.user_id))
+        response.raise_for_status()
+        html = BeautifulSoup(response.text, 'html.parser')
+        
+        preload_json = html.select('#meta-preload-data')[0]['content']
+        preload = hoordu.Dynamic.from_json(preload_json)
+        
+        user = preload.user[str(options.user_id)]
+        
+        related_urls = []
+        if user.webpage:
+            related_urls.append(user.webpage)
+        
+        related_urls.extend(s.url for s in user.social.values())
+        
+        comment_html = BeautifulSoup(unescape(user.commentHtml), 'html.parser')
+        related_urls.extend(a.text for a in comment_html.select('a'))
+        
+        creator_response = self.http.get(FANBOX_URL_FORMAT.format(user_id=options.user_id), allow_redirects=False)
+        if creator_response.status_code // 100 == 3:
+            related_urls.append(creator_response.headers['Location'])
+        
+        return SearchDetails(
+            hint=user.name,
+            title=user.name,
+            description=user.comment,
+            thumbnail_url=user.imageBig,
+            related_urls=related_urls
         )
     
     def search(self, options):

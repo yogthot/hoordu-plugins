@@ -9,7 +9,9 @@ from tempfile import mkstemp
 import shutil
 from urllib.parse import urlparse
 import functools
+
 import requests
+from bs4 import BeautifulSoup
 
 import hoordu
 from hoordu.models import *
@@ -22,6 +24,7 @@ FANCLUB_REGEXP = re.compile('^https?:\/\/fantia\.jp\/fanclubs\/(?P<fanclub_id>\d
 FILENAME_REGEXP = re.compile('^[a-z0-9]+-(?P<filename>.+)$')
 
 POST_GET_URL = 'https://fantia.jp/api/v1/posts/{post_id}'
+FANCLUB_URL = 'https://fantia.jp/fanclubs/{fanclub_id}'
 FANCLUB_GET_URL = 'https://fantia.jp/api/v1/fanclubs/{fanclub_id}'
 FILE_DOWNLOAD_URL = 'https://fantia.jp{download_uri}'
 
@@ -39,7 +42,7 @@ class CreatorIterator(BaseIterator):
         post_id = self.state.head_id if direction == FetchDirection.newer else self.state.tail_id
         
         if post_id is None:
-            response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.creator_id))
+            response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id))
             response.raise_for_status()
             fanclub = hoordu.Dynamic.from_json(response.text).fanclub
             
@@ -489,6 +492,25 @@ class Fantia(BasePlugin):
     def search_form(self):
         return Form('{} search'.format(self.name),
             ('creator_id', Input('fanclub id', [validators.required()]))
+        )
+    
+    def get_search_details(self, options):
+        html_response = self.http.get(FANCLUB_URL.format(fanclub_id=options.creator_id))
+        html_response.raise_for_status()
+        html = BeautifulSoup(html_response.text, 'html.parser')
+        
+        response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=options.creator_id))
+        response.raise_for_status()
+        fanclub = hoordu.Dynamic.from_json(response.text).fanclub
+        
+        related_urls = [x['href'] for x in html.select('main .btns:not(.share-btns) a')]
+        
+        return SearchDetails(
+            hint=fanclub.user.name,
+            title=fanclub.name,
+            description=fanclub.comment,
+            thumbnail_url=fanclub.icon.main,
+            related_urls=related_urls
         )
 
 Plugin = Fantia

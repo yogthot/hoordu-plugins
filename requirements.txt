@@ -2,3 +2,5 @@ requests
 python-dateutil
 requests-oauthlib
 python-twitter
+beautifulsoup4
+

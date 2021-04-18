@@ -10,6 +10,7 @@ import shutil
 from urllib.parse import urlparse, parse_qs
 import itertools
 import functools
+
 import requests
 
 import hoordu
@@ -53,11 +54,7 @@ class CreatorIterator(BaseIterator):
         update = False
         
         if self.options.pixiv_id is not None:
-            response = self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=self.options.pixiv_id), allow_redirects=False)
-            creator_url = response.headers['Location']
-            
-            match = CREATOR_URL_REGEXP.match(creator_url)
-            creator = match.group('creator')
+            creator = self._plugin._get_creator_id(pixiv_id)
             
             if creator and self.options.creator != creator:
                 self.options.creator = self.options.creator = creator
@@ -238,6 +235,13 @@ class Fanbox(BasePlugin):
                 })
         
         return None
+    
+    def _get_creator_id(self, pixiv_id):
+        response = self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=pixiv_id), allow_redirects=False)
+        creator_url = response.headers['Location']
+        
+        match = CREATOR_URL_REGEXP.match(creator_url)
+        return match.group('creator')
     
     def _download_file(self, url, filename=None):
         # TODO file downloads should be managed by hoordu
@@ -535,6 +539,26 @@ class Fanbox(BasePlugin):
     def search_form(self):
         return Form('{} search'.format(self.name),
             ('creator', Input('creator', [validators.required()]))
+        )
+    
+    def get_search_details(self, options):
+        pixiv_id = options.get('pixiv_id')
+        
+        creator_id = self._get_creator_id(pixiv_id) if pixiv_id else options.creator 
+        
+        response = self.http.get(CREATOR_GET_URL.format(creator=creator_id))
+        response.raise_for_status()
+        creator = hoordu.Dynamic.from_json(response.text).body
+        
+        options.creator = creator_id
+        options.pixiv_id = creator.user.userId
+        
+        return SearchDetails(
+            hint=creator.creatorId,
+            title=creator.user.name,
+            description=creator.description,
+            thumbnail_url=creator.user.iconUrl,
+            related_urls=creator.profileLinks
         )
 
 Plugin = Fanbox
