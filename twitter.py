@@ -9,7 +9,6 @@ import shutil
 from urllib.parse import urlparse
 import functools
 import urllib3
-http = urllib3.PoolManager()
 
 from requests_oauthlib import OAuth1Session
 import twitter
@@ -27,7 +26,7 @@ TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
 TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
 TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$', flags=re.IGNORECASE)
 
-URL_REGEXP = re.compile('https?://\S+')
+URL_REGEXP = re.compile('https?:\/\/t\.co\/[0-9a-z]+', flags=re.IGNORECASE)
 PROFILE_IMAGE_REGEXP = re.compile('^(?P<base>.+_)(?P<size>[^\.]+)(?P<ext>.+)$')
 
 MEDIA_URL = '{base_url}?format={ext}&name={size}'
@@ -66,23 +65,7 @@ def oauth_finish(consumer_key, consumer_secret, oauth_token, oauth_token_secret,
     
     return access_token_key, access_token_secret
 
-def unwind_url(url):
-    final_url = url
-    try:
-        while url is not None:
-            resp = http.request('HEAD', url, redirect=False, timeout=10)
-            if resp.status // 100 == 3:
-                url = resp.headers.get('Location')
-                if url is not None:
-                    final_url = url
-            else:
-                url = None
-    except:
-        pass
-    
-    return final_url
-
-class TweetIterator(BaseIterator):
+class TweetIterator(IteratorBase):
     def __init__(self, twitter, subscription=None, options=None):
         super().__init__(twitter, subscription=subscription, options=options)
         
@@ -211,7 +194,7 @@ class TweetIterator(BaseIterator):
             self.subscription.state = self.state.to_json()
             self.plugin.core.add(self.subscription)
 
-class Twitter(BasePlugin):
+class Twitter(PluginBase):
     name = 'twitter'
     version = 3
     iterator = TweetIterator
@@ -298,6 +281,8 @@ class Twitter(BasePlugin):
     def __init__(self, core, config=None):
         super().__init__(core, config)
         
+        self.http = urllib3.PoolManager()
+        
         self._init_api()
     
     def _init_api(self):
@@ -308,6 +293,29 @@ class Twitter(BasePlugin):
             access_token_secret=self.config.get('access_token_secret', None),
             tweet_mode='extended'
         )
+    
+    def _unwind_url(self, url, iterations=None):
+        final_url = url
+        i = 0
+        try:
+            while url is not None:
+                resp = self.http.request('HEAD', url, redirect=False, timeout=10)
+                if resp.status // 100 == 3:
+                    url = resp.headers.get('Location')
+                    if url is not None:
+                        final_url = url
+                else:
+                    url = None
+                
+                i += 1
+                if iterations is not None and i >= iterations:
+                    break
+                
+        except:
+            pass
+        
+        return final_url
+    
     
     def parse_url(self, url):
         if url.isdigit():
@@ -332,28 +340,8 @@ class Twitter(BasePlugin):
         
         return None
     
-    def _download_file(self, url, filename=None):
-        # TODO file downloads should be managed by hoordu
-        # so that rate limiting and a download manager can be
-        # implemented easily and in a centralized way
-        self.log.debug('downloading %s', url)
-        
-        if filename is not None:
-            suffix = '-{}'.format(filename)
-            
-        else:
-            suffix = os.path.splitext(urlparse(url).path)[-1]
-            if not suffix.startswith('.'):
-                suffix = ''
-        
-        fd, path = mkstemp(suffix=suffix)
-        
-        with http.request('GET', url, preload_content=False) as resp, \
-                os.fdopen(fd, 'w+b') as file:
-            resp.read = functools.partial(resp.read, decode_content=True)
-            shutil.copyfileobj(resp, file)
-        
-        return path
+    def _download_media_file(self, base_url, ext, size, filename=None):
+        return self.core.download(MEDIA_URL.format(base_url=base_url, ext=ext, size=size), suffix=filename)[0]
     
     def _download_video(self, media):
         variants = media.video_info.get('variants', [])
@@ -365,32 +353,10 @@ class Twitter(BasePlugin):
         )
         
         if variant is not None:
-            return self._download_file(variant['url'])
+            path, resp = self.core.download(variant['url'])
+            return path
         else:
             return None
-    
-    def _download_media(self, media, thumbnail=False, file=False):
-        thumb = None
-        orig = None
-        
-        base_url, ext = media.media_url.rsplit('.', 1)
-        filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
-        
-        if media.type == 'photo':
-            if thumbnail:
-                thumb = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=THUMB_SIZE), filename)
-            
-            if file:
-                orig = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=ORIG_SIZE), filename)
-            
-        elif media.type == 'video' or media.type == 'animated_gif':
-            if thumbnail:
-                thumb = self._download_file(MEDIA_URL.format(base_url=base_url, ext=ext, size=THUMB_SIZE), filename)
-            
-            if file:
-                orig = self._download_video(media)
-        
-        return thumb, orig
     
     def tweet_to_remote_post(self, tweet, remote_post=None, preview=False):
         # get the original tweet if this is a retweet
@@ -446,7 +412,7 @@ class Twitter(BasePlugin):
                     for url in tweet.urls:
                         # the unwound section is a premium feature
                         self.log.info('found url %s', url.url)
-                        final_url = unwind_url(url.url)
+                        final_url = self._unwind_url(url.url)
                         remote_post.related.append(Related(url=final_url))
                 
                 self.core.add(remote_post)
@@ -470,8 +436,36 @@ class Twitter(BasePlugin):
                 
                 if need_thumb or need_file:
                     self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
-                    thumb, orig = self._download_media(tweet.media[file.remote_order], thumbnail=need_thumb, file=need_file)
-                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                    
+                    media = tweet.media[file.remote_order]
+                    thumb = None
+                    orig = None
+                    
+                    base_url, ext = media.media_url.rsplit('.', 1)
+                    filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
+                    
+                    if media.type == 'photo':
+                        if need_thumb:
+                            thumb = self._download_media_file(base_url, ext, THUMB_SIZE, filename)
+                        
+                        if need_file:
+                            orig = self._download_media_file(base_url, ext, ORIG_SIZE, filename)
+                        
+                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        file.ext = ext
+                        file.thumb_ext = ext
+                        self.core.add(file)
+                        
+                    elif media.type == 'video' or media.type == 'animated_gif':
+                        if need_thumb:
+                            thumb = self._download_media_file(base_url, ext, THUMB_SIZE, filename)
+                        
+                        if need_file:
+                            orig = self._download_video(media)
+                        
+                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        file.thumb_ext = ext
+                        self.core.add(file)
         
         return remote_post
     
@@ -519,11 +513,11 @@ class Twitter(BasePlugin):
         
         related_urls = []
         if user.url is not None:
-            related_urls.append(unwind_url(user.url))
+            related_urls.append(self._unwind_url(user.url))
         
         if user.description is not None:
             for url in re.findall(URL_REGEXP, user.description):
-                related_urls.append(unwind_url(url))
+                related_urls.append(self._unwind_url(url))
         
         thumb_url = user.profile_image_url
         match = PROFILE_IMAGE_REGEXP.match(user.profile_image_url)

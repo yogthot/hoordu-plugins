@@ -21,6 +21,7 @@ from hoordu.forms import *
 CREATOR_ID_GET_URL = 'https://www.pixiv.net/fanbox/creator/{pixiv_id}'
 CREATOR_GET_URL = 'https://api.fanbox.cc/creator.get?creatorId={creator}'
 CREATOR_URL_REGEXP = re.compile('https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/', flags=re.IGNORECASE)
+PIXIV_URL = 'https://www.pixiv.net/en/users/{pixiv_id}'
 
 POST_FORMAT = 'https://fanbox.cc/@/posts/{post_id}'
 POST_REGEXP = [
@@ -36,7 +37,7 @@ POST_GET_URL = 'https://api.fanbox.cc/post.info?postId={post_id}'
 CREATOR_POSTS_URL = 'https://api.fanbox.cc/post.listCreator'
 PAGE_LIMIT = 10
 
-class CreatorIterator(BaseIterator):
+class CreatorIterator(IteratorBase):
     def __init__(self, fanbox, subscription=None, options=None):
         super().__init__(fanbox, subscription=subscription, options=options)
         
@@ -156,7 +157,7 @@ class CreatorIterator(BaseIterator):
             self.subscription.state = self.state.to_json()
             self.plugin.core.add(self.subscription)
 
-class Fanbox(BasePlugin):
+class Fanbox(PluginBase):
     name = 'fanbox'
     version = 1
     iterator = CreatorIterator
@@ -209,11 +210,12 @@ class Fanbox(BasePlugin):
     def _init_api(self):
         self.http = requests.Session()
         
-        self.http.headers.update({
+        self._headers = {
             'Origin': 'https://www.fanbox.cc',
             'Referer': 'https://www.fanbox.cc/',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        })
+        }
+        self.http.headers.update(self._headers)
         
         cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.config.FANBOXSESSID)
         self.http.cookies.set_cookie(cookie)
@@ -243,28 +245,11 @@ class Fanbox(BasePlugin):
         match = CREATOR_URL_REGEXP.match(creator_url)
         return match.group('creator')
     
-    def _download_file(self, url, filename=None):
-        # TODO file downloads should be managed by hoordu
-        # so that rate limiting and a download manager can be
-        # implemented easily and in a centralized way
-        self.log.debug('downloading %s', url)
-        
-        if filename is not None:
-            suffix = '-{}'.format(filename)
-            
-        else:
-            suffix = os.path.splitext(urlparse(url).path)[-1]
-            if not suffix.startswith('.'):
-                suffix = ''
-        
-        fd, path = mkstemp(suffix=suffix)
-        
-        with self.http.get(url, stream=True) as resp:
-            resp.raise_for_status()
-            resp.raw.read = functools.partial(resp.raw.read, decode_content=True)
-            with os.fdopen(fd, 'w+b') as file:
-                shutil.copyfileobj(resp.raw, file)
-        
+    def _download_file(self, url):
+        cookies = {
+            'FANBOXSESSID': self.config.FANBOXSESSID
+        }
+        path, resp = self.core.download(url, headers=self._headers, cookies=cookies)
         return path
     
     def _to_remote_post(self, post, remote_post=None, preview=False):
@@ -552,6 +537,9 @@ class Fanbox(BasePlugin):
         
         options.creator = creator_id
         options.pixiv_id = creator.user.userId
+        
+        related_urls = creator.profileLinks
+        related_urls.append(PIXIV_URL.format(pixiv_id=pixiv_id))
         
         return SearchDetails(
             hint=creator.creatorId,

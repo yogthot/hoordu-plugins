@@ -28,7 +28,7 @@ FANCLUB_URL = 'https://fantia.jp/fanclubs/{fanclub_id}'
 FANCLUB_GET_URL = 'https://fantia.jp/api/v1/fanclubs/{fanclub_id}'
 FILE_DOWNLOAD_URL = 'https://fantia.jp{download_uri}'
 
-class CreatorIterator(BaseIterator):
+class CreatorIterator(IteratorBase):
     def __init__(self, fantia, subscription=None, options=None):
         super().__init__(fantia, subscription=subscription, options=options)
         
@@ -107,7 +107,7 @@ class CreatorIterator(BaseIterator):
             self.subscription.state = self.state.to_json()
             self.plugin.core.add(self.subscription)
 
-class Fantia(BasePlugin):
+class Fantia(PluginBase):
     name = 'fantia'
     version = 1
     iterator = CreatorIterator
@@ -160,11 +160,12 @@ class Fantia(BasePlugin):
     def _init_api(self):
         self.http = requests.Session()
         
-        self.http.headers.update({
+        self._headers = {
             'Origin': 'https://fantia.jp/',
             'Referer': 'https://fantia.jp/',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        })
+        }
+        self.http.headers.update(self._headers)
         
         cookie = requests.cookies.create_cookie(name='_session_id', value=self.config.session_id)
         self.http.cookies.set_cookie(cookie)
@@ -185,28 +186,11 @@ class Fantia(BasePlugin):
         
         return None
     
-    def _download_file(self, url, filename=None):
-        # TODO file downloads should be managed by hoordu
-        # so that rate limiting and a download manager can be
-        # implemented easily and in a centralized way
-        self.log.debug('downloading %s', url)
-        
-        if filename is not None:
-            suffix = '-{}'.format(filename)
-            
-        else:
-            suffix = os.path.splitext(urlparse(url).path)[-1]
-            if not suffix.startswith('.'):
-                suffix = ''
-        
-        fd, path = mkstemp(suffix=suffix)
-        
-        with self.http.get(url, stream=True) as resp:
-            resp.raise_for_status()
-            resp.raw.read = functools.partial(resp.raw.read, decode_content=True)
-            with os.fdopen(fd, 'w+b') as file:
-                shutil.copyfileobj(resp.raw, file)
-        
+    def _download_file(self, url):
+        cookies = {
+            '_session_id': self.config.session_id
+        }
+        path, resp = self.core.download(url, headers=self._headers, cookies=cookies)
         return path
     
     def _content_to_post(self, post, content, remote_post=None, preview=False):

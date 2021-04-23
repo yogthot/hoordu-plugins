@@ -43,7 +43,7 @@ USER_BOOKMARKS_URL = 'https://www.pixiv.net/ajax/user/{user_id}/illusts/bookmark
 BOOKMARKS_LIMIT = 48
 
 
-class IllustIterator(BaseIterator):
+class IllustIterator(IteratorBase):
     def __init__(self, pixiv, subscription=None, options=None):
         super().__init__(pixiv, subscription=subscription, options=options)
         
@@ -65,6 +65,7 @@ class IllustIterator(BaseIterator):
         
         posts = []
         for bucket in ('illusts', 'manga'):
+            # these are [] when empty
             if isinstance(body[bucket], dict):
                 posts.extend(body[bucket].keys())
         
@@ -118,7 +119,7 @@ class IllustIterator(BaseIterator):
             self.subscription.state = self.state.to_json()
             self.plugin.core.add(self.subscription)
 
-class BookmarkIterator(BaseIterator):
+class BookmarkIterator(IteratorBase):
     def __init__(self, pixiv, subscription=None, options=None):
         super().__init__(pixiv, subscription=subscription, options=options)
         
@@ -225,7 +226,7 @@ class BookmarkIterator(BaseIterator):
             self.subscription.state = self.state.to_json()
             self.plugin.core.add(self.subscription)
 
-class Pixiv(BasePlugin):
+class Pixiv(PluginBase):
     name = 'pixiv'
     version = 1
     
@@ -277,9 +278,10 @@ class Pixiv(BasePlugin):
     def _init_api(self):
         self.http = requests.Session()
         
-        self.http.headers.update({
+        self._headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        })
+        }
+        self.http.headers.update(self._headers)
         
         cookie = requests.cookies.create_cookie(name='PHPSESSID', value=self.config.PHPSESSID)
         self.http.cookies.set_cookie(cookie)
@@ -311,28 +313,15 @@ class Pixiv(BasePlugin):
         
         return None
     
-    def _download_file(self, url, filename=None):
-        # TODO file downloads should be managed by hoordu
-        # so that rate limiting and a download manager can be
-        # implemented easily and in a centralized way
-        self.log.debug('downloading %s', url)
+    def _download_file(self, url):
+        cookies = {
+            'PHPSESSID': self.config.PHPSESSID
+        }
         
-        if filename is not None:
-            suffix = '-{}'.format(filename)
-            
-        else:
-            suffix = os.path.splitext(urlparse(url).path)[-1]
-            if not suffix.startswith('.'):
-                suffix = ''
+        headers = dict(self._headers)
+        headers['Referer'] = 'https://www.pixiv.net/'
         
-        fd, path = mkstemp(suffix=suffix)
-        
-        with self.http.get(url, headers={'Referer': 'https://i.pximg.net/'}, stream=True) as resp:
-            resp.raise_for_status()
-            resp.raw.read = functools.partial(resp.raw.read, decode_content=True)
-            with os.fdopen(fd, 'w+b') as file:
-                shutil.copyfileobj(resp.raw, file)
-        
+        path, resp = self.core.download(url, headers=headers, cookies=cookies)
         return path
     
     def _to_remote_post(self, post, remote_post=None, preview=False):
@@ -356,12 +345,17 @@ class Pixiv(BasePlugin):
             if remote_post is None:
                 self.log.info('creating new post')
                 
+                try:
+                    comment = post.extraData.meta.twitter.description
+                except:
+                    comment = post.description
+                
                 remote_post = RemotePost(
                     source=self.source,
                     original_id=post_id,
                     url=POST_FORMAT.format(post_id=post_id),
                     title=post.title,
-                    comment=post.description,
+                    comment=comment,
                     type=post_type,
                     post_time=post_time
                 )
@@ -398,6 +392,10 @@ class Pixiv(BasePlugin):
                 if post.isOriginal:
                     original_tag = self.core.get_remote_tag(TagCategory.copyright, 'original')
                     remote_post.tags.append(original_tag)
+                
+                comment_html = BeautifulSoup(post.description, 'html.parser')
+                for a in comment_html.select('a'):
+                    remote_post.related.append(Related(url=a.text))
                 
                 self.core.add(remote_post)
         
@@ -534,7 +532,7 @@ class Pixiv(BasePlugin):
         html = BeautifulSoup(response.text, 'html.parser')
         
         preload_json = html.select('#meta-preload-data')[0]['content']
-        preload = hoordu.Dynamic.from_json(preload_json)
+        preload = hoordu.Dynamic.from_json(unescape(preload_json))
         
         user = preload.user[str(options.user_id)]
         
@@ -542,9 +540,11 @@ class Pixiv(BasePlugin):
         if user.webpage:
             related_urls.append(user.webpage)
         
-        related_urls.extend(s.url for s in user.social.values())
+        # it's [] when it's empty
+        if isinstance(user.social, dict):
+            related_urls.extend(s.url for s in user.social.values())
         
-        comment_html = BeautifulSoup(unescape(user.commentHtml), 'html.parser')
+        comment_html = BeautifulSoup(user.commentHtml, 'html.parser')
         related_urls.extend(a.text for a in comment_html.select('a'))
         
         creator_response = self.http.get(FANBOX_URL_FORMAT.format(user_id=options.user_id), allow_redirects=False)
