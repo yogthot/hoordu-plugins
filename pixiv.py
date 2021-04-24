@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import dateutil.parser
 from tempfile import mkstemp
 import shutil
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import unquote
 import itertools
 import functools
 from xml.sax.saxutils import unescape
@@ -33,6 +33,7 @@ USER_REGEXP = [
 BOOKMARKS_REGEXP = [
     re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)\/bookmarks\/artworks(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
+REDIRECT_REGEXP = re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/jump\.php\?(?P<url>.*)$', flags=re.IGNORECASE)
 
 USER_URL = 'https://www.pixiv.net/en/users/{user_id}'
 POST_GET_URL = 'https://www.pixiv.net/ajax/illust/{post_id}'
@@ -41,7 +42,6 @@ POST_UGOIRA_URL = 'https://www.pixiv.net/ajax/illust/{post_id}/ugoira_meta'
 USER_POSTS_URL = 'https://www.pixiv.net/ajax/user/{user_id}/profile/all'
 USER_BOOKMARKS_URL = 'https://www.pixiv.net/ajax/user/{user_id}/illusts/bookmarks'
 BOOKMARKS_LIMIT = 48
-
 
 class IllustIterator(IteratorBase):
     def __init__(self, pixiv, subscription=None, options=None):
@@ -324,6 +324,19 @@ class Pixiv(PluginBase):
         path, resp = self.core.download(url, headers=headers, cookies=cookies)
         return path
     
+    def _parse_href(self, page_url, href):
+        if re.match('^https?:\/\/\S+$', href):
+            return href
+        
+        if href.startswith('/'):
+            base_url = re.match('^[^:]+:\/\/[^\/]+', page_url).group(0)
+            return base_url + href
+        
+        else:
+            base_url = re.match('^.*/', page_url).group(0)
+            return base_url + href
+        
+    
     def _to_remote_post(self, post, remote_post=None, preview=False):
         post_id = post.id
         user_id = post.userId
@@ -345,17 +358,33 @@ class Pixiv(PluginBase):
             if remote_post is None:
                 self.log.info('creating new post')
                 
-                try:
-                    comment = post.extraData.meta.twitter.description
-                except:
-                    comment = post.description
+                # there is no visual difference in multiple whitespace (or newlines for that matter)
+                # unless inside <pre>, but that's too hard to deal with :(
+                description = re.sub('\s+', ' ', post.description)
+                comment_html = BeautifulSoup(description, 'html.parser')
+                
+                urls = []
+                for a in comment_html.select('a'):
+                    url = self._parse_href(POST_FORMAT.format(post_id=post_id), a['href'])
+                    match = REDIRECT_REGEXP.match(url)
+                    if match:
+                        url = unquote(match.group('url'))
+                        urls.append(url)
+                        
+                    else:
+                        urls.append(url)
+                    
+                    a.replace_with(url)
+                
+                for br in comment_html.find_all('br'):
+                    br.replace_with('\n')
                 
                 remote_post = RemotePost(
                     source=self.source,
                     original_id=post_id,
                     url=POST_FORMAT.format(post_id=post_id),
                     title=post.title,
-                    comment=comment,
+                    comment=comment_html.text,
                     type=post_type,
                     post_time=post_time
                 )
@@ -393,9 +422,8 @@ class Pixiv(PluginBase):
                     original_tag = self.core.get_remote_tag(TagCategory.copyright, 'original')
                     remote_post.tags.append(original_tag)
                 
-                comment_html = BeautifulSoup(post.description, 'html.parser')
-                for a in comment_html.select('a'):
-                    remote_post.related.append(Related(url=a.text))
+                for url in urls:
+                    remote_post.related.append(Related(url=url))
                 
                 self.core.add(remote_post)
         
