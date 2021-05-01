@@ -55,7 +55,7 @@ class CreatorIterator(IteratorBase):
         update = False
         
         if self.options.pixiv_id is not None:
-            creator = self._plugin._get_creator_id(pixiv_id)
+            creator = self.plugin._get_creator_id(self.options.pixiv_id)
             
             if creator and self.options.creator != creator:
                 self.options.creator = self.options.creator = creator

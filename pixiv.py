@@ -364,8 +364,9 @@ class Pixiv(PluginBase):
                 comment_html = BeautifulSoup(description, 'html.parser')
                 
                 urls = []
+                page_url = POST_FORMAT.format(post_id=post_id)
                 for a in comment_html.select('a'):
-                    url = self._parse_href(POST_FORMAT.format(post_id=post_id), a['href'])
+                    url = self._parse_href(page_url, a['href'])
                     match = REDIRECT_REGEXP.match(url)
                     if match:
                         url = unquote(match.group('url'))

@@ -186,11 +186,11 @@ class Fantia(PluginBase):
         
         return None
     
-    def _download_file(self, url):
+    def _download_file(self, url, filename=None):
         cookies = {
             '_session_id': self.config.session_id
         }
-        path, resp = self.core.download(url, headers=self._headers, cookies=cookies)
+        path, resp = self.core.download(url, headers=self._headers, cookies=cookies, suffix=filename)
         return path
     
     def _content_to_post(self, post, content, remote_post=None, preview=False):
