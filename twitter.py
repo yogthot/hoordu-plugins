@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
-
 import os
 import re
-import json
 from datetime import datetime
 from tempfile import mkstemp
 import shutil
@@ -23,9 +20,13 @@ OAUTH_ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
 OAUTH_AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
-TWEET_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
+TWEET_REGEXP = [
+    re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE),
+    re.compile('^https?:\/\/twitter\.com\/i\/web\/status\/(?P<tweet_id>\d+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
+]
 TIMELINE_REGEXP = re.compile('^https?:\/\/twitter\.com\/(?P<user>[^\/]+)(?:\/(?P<type>[^\/]+)?)?(?:\?.*)?$', flags=re.IGNORECASE)
 
+SUPPORT_URL_REGEXP = re.compile('^https?:\/\/support\.twitter\.com\/.*$', re.IGNORECASE)
 URL_REGEXP = re.compile('https?:\/\/t\.co\/[0-9a-z]+', flags=re.IGNORECASE)
 PROFILE_IMAGE_REGEXP = re.compile('^(?P<base>.+_)(?P<size>[^\.]+)(?P<ext>.+)$')
 
@@ -220,8 +221,9 @@ class Twitter(PluginBase):
             if parameters is not None:
                 config.update(parameters)
                 
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
+                core.commit()
         
         if not config.defined('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
@@ -239,6 +241,7 @@ class Twitter(PluginBase):
                 config.oauth_token_secret = oauth_token_secret
                 source.config = config.to_json()
                 core.add(source)
+                core.commit()
                 
                 oauth_form = Form('twitter authentication',
                     Label('please login to twitter via this url to get your pin:\n{}'.format(url)),
@@ -260,6 +263,7 @@ class Twitter(PluginBase):
                 config.access_token_secret = access_token_secret
                 source.config = config.to_json()
                 core.add(source)
+                core.commit()
                 
                 return True, cls(core)
             
@@ -321,9 +325,10 @@ class Twitter(PluginBase):
         if url.isdigit():
             return url
         
-        match = TWEET_REGEXP.match(url)
-        if match:
-            return match.group('tweet_id')
+        for regexp in TWEET_REGEXP:
+            match = regexp.match(url)
+            if match:
+                return match.group('tweet_id')
         
         match = TIMELINE_REGEXP.match(url)
         if match:
@@ -368,6 +373,7 @@ class Twitter(PluginBase):
         user_id = tweet.user.id_str
         text = tweet.full_text
         post_time = datetime.utcfromtimestamp(tweet.created_at_in_seconds)
+        update = False
         
         self.log.info('getting tweet %s', original_id)
         
@@ -382,7 +388,7 @@ class Twitter(PluginBase):
                     comment=text,
                     type=PostType.set,
                     post_time=post_time,
-                    metadata_=json.dumps({'user': user})
+                    metadata_=hoordu.Dynamic({'user': user}).to_json()
                 )
                 
                 user_tag = self.core.get_remote_tag(TagCategory.artist, user_id)
@@ -391,8 +397,7 @@ class Twitter(PluginBase):
                 if user_tag.update_metadata('user', user):
                     self.core.add(user_tag)
                 
-                if tweet.favorited is True:
-                    remote_post.favorite = True
+                remote_post.favorite = tweet.favorited is True
                 
                 if tweet.possibly_sensitive:
                     nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
@@ -410,8 +415,11 @@ class Twitter(PluginBase):
                 
                 if tweet.urls is not None:
                     for url in tweet.urls:
-                        # the unwound section is a premium feature
+                        if SUPPORT_URL_REGEXP.match(url.url):
+                            raise APIError(text)
+                        
                         self.log.info('found url %s', url.url)
+                        # the unwound section is a premium feature
                         final_url = self._unwind_url(url.url)
                         remote_post.related.append(Related(url=final_url))
                 
@@ -419,6 +427,47 @@ class Twitter(PluginBase):
                 
             else:
                 self.log.info('post already exists: %s', remote_post.id)
+                update = True
+            
+        else:
+            update = True
+        
+        if update:
+            remote_post.comment = text
+            remote_post.favorite = tweet.favorited is True
+            
+            existing_tags = [(t.category, t.tag) for t in remote_post.tags]
+            existing_urls = [r.url for r in remote_post.related]
+            
+            if tweet.possibly_sensitive:
+                if (TagCategory.meta, 'nsfw') not in existing_tags:
+                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    remote_post.tags.append(nsfw_tag)
+            
+            if tweet.hashtags is not None:
+                for hashtag in tweet.hashtags:
+                    tag = hashtag.text
+                    if (TagCategory.general, tag) not in existing_tags:
+                        nsfw_tag = self.core.get_remote_tag(TagCategory.general, tag)
+                        remote_post.tags.append(nsfw_tag)
+            
+            if tweet.in_reply_to_status_id is not None:
+                url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
+                if url not in existing_urls:
+                    remote_post.related.append(Related(url=url))
+            
+            if tweet.urls is not None:
+                for url in tweet.urls:
+                    if SUPPORT_URL_REGEXP.match(url.url):
+                        raise APIError(text)
+                    
+                    self.log.info('found url %s', url.url)
+                    # the unwound section is a premium feature
+                    final_url = self._unwind_url(url.url)
+                    if final_url not in existing_urls:
+                        remote_post.related.append(Related(url=final_url))
+            
+            self.core.add(remote_post)
         
         if tweet.media is not None:
             available = set(range(len(tweet.media)))
@@ -441,7 +490,7 @@ class Twitter(PluginBase):
                     thumb = None
                     orig = None
                     
-                    base_url, ext = media.media_url.rsplit('.', 1)
+                    base_url, ext = media.media_url_https.rsplit('.', 1)
                     filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
                     
                     if media.type == 'photo':
@@ -469,25 +518,29 @@ class Twitter(PluginBase):
         
         return remote_post
     
-    def download(self, url=None, remote_post=None, preview=False):
-        if url is None and remote_post is None:
-            raise ValueError('either url or remote_post must be passed')
+    def download(self, id=None, remote_post=None, preview=False):
+        if id is None and remote_post is None:
+            raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             tweet_id = remote_post.original_id
             self.log.info('update request for %s', tweet_id)
             
         else:
-            self.log.info('download request for %s', url)
-            if url.isdigit():
-                tweet_id = url
+            self.log.info('download request for %s', id)
+            if id.isdigit():
+                tweet_id = id
                 
             else:
-                match = TWEET_REGEXP.match(url)
-                if not match:
-                    raise ValueError('unsupported url: {}'.format(repr(url)))
+                tweet_id = None
+                for regexp in TWEET_REGEXP:
+                    match = regexp.match(id)
+                    if match:
+                        tweet_id = match.group('tweet_id')
+                        break
                 
-                tweet_id = match.group('tweet_id')
+                if tweet_id is None:
+                    raise ValueError('unsupported url: {}'.format(repr(id)))
         
         tweet = self.api.GetStatus(tweet_id)
         self.log.debug('tweet: %s', tweet)
@@ -533,6 +586,9 @@ class Twitter(PluginBase):
             thumbnail_url=thumb_url,
             related_urls=related_urls
         )
+    
+    def subscription_repr(self, options):
+        return '{}:{}'.format(options.method, options.user_id)
 
 Plugin = Twitter
 

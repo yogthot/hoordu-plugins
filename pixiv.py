@@ -2,7 +2,6 @@
 
 import os
 import re
-import json
 from datetime import datetime, timedelta, timezone
 import dateutil.parser
 from tempfile import mkstemp
@@ -143,7 +142,13 @@ class BookmarkIterator(IteratorBase):
         total = 0
         first_iteration = True
         while True:
-            page_size = BOOKMARKS_LIMIT if n is None else min(n - total, BOOKMARKS_LIMIT)
+            if total > 0:
+                page_size = BOOKMARKS_LIMIT if n is None else min(n - total, BOOKMARKS_LIMIT)
+                
+            else:
+                # request full pages until it finds the first new id
+                page_size = BOOKMARKS_LIMIT
+            
             params = {
                 'tag': '',
                 'offset': str(offset),
@@ -248,8 +253,9 @@ class Pixiv(PluginBase):
             if parameters is not None:
                 config.update(parameters)
                 
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
+                core.commit()
         
         if not config.defined('PHPSESSID'):
             # but if they're still None, the api can't be used
@@ -511,29 +517,29 @@ class Pixiv(PluginBase):
         
         return remote_post
     
-    def download(self, url=None, remote_post=None, preview=False):
-        if url is None and remote_post is None:
-            raise ValueError('either url or remote_post must be passed')
+    def download(self, id=None, remote_post=None, preview=False):
+        if id is None and remote_post is None:
+            raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             post_id = remote_post.original_id
             self.log.info('update request for %s', post_id)
             
         else:
-            self.log.info('download request for %s', url)
-            if url.isdigit():
-                post_id = url
+            self.log.info('download request for %s', id)
+            if id.isdigit():
+                post_id = id
                 
             else:
                 post_id = None
                 for regexp in POST_REGEXP:
-                    match = regexp.match(url)
+                    match = regexp.match(id)
                     if match:
                         post_id = match.group('post_id')
                         break
                 
                 if post_id is None:
-                    raise ValueError('unsupported url: {}'.format(repr(url)))
+                    raise ValueError('unsupported id: {}'.format(repr(id)))
         
         response = self.http.get(POST_GET_URL.format(post_id=post_id))
         response.raise_for_status()
@@ -588,23 +594,18 @@ class Pixiv(PluginBase):
             related_urls=related_urls
         )
     
-    def search(self, options):
-        options = hoordu.Dynamic.from_json(options)
-        
-        if options.method == 'illusts':
-            return IllustIterator(self, options=options)
-            
-        elif options.method == 'bookmarks':
-            return BookmarkIterator(self, options=options)
+    def subscription_repr(self, options):
+        return '{}:{}'.format(options.method, options.user_id)
     
-    def get_iterator(self, subscription):
-        options = hoordu.Dynamic.from_json(subscription.options)
+    def iterator(self, plugin, subscription=None, options=None):
+        if subscription is not None:
+            options = hoordu.Dynamic.from_json(subscription.options)
         
         if options.method == 'illusts':
-            return IllustIterator(self, subscription=subscription)
+            return IllustIterator(plugin, subscription=subscription, options=options)
             
         elif options.method == 'bookmarks':
-            return BookmarkIterator(self, subscription=subscription)
+            return BookmarkIterator(plugin, subscription=subscription, options=options)
 
 Plugin = Pixiv
 

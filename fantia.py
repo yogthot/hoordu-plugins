@@ -2,7 +2,6 @@
 
 import os
 import re
-import json
 from datetime import datetime, timezone
 import dateutil.parser
 from tempfile import mkstemp
@@ -130,8 +129,9 @@ class Fantia(PluginBase):
             if parameters is not None:
                 config.update(parameters)
                 
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
+                core.commit()
         
         if not config.defined('session_id'):
             # but if they're still None, the api can't be used
@@ -208,9 +208,9 @@ class Fantia(PluginBase):
             if remote_post is None:
                 self.log.info('creating new post')
                 
-                metadata = {}
+                metadata = hoordu.Dynamic()
                 if content.plan is not None:
-                    metadata['price'] = content.plan.price
+                    metadata.price = content.plan.price
                 
                 remote_post = RemotePost(
                     source=self.source,
@@ -220,7 +220,7 @@ class Fantia(PluginBase):
                     comment=content.comment,
                     type=PostType.collection,
                     post_time=post_time,
-                    metadata_=json.dumps(metadata)
+                    metadata_=metadata.to_json()
                 )
                 
                 if post.liked is True:
@@ -442,23 +442,23 @@ class Fantia(PluginBase):
         
         return remote_posts
     
-    def download(self, url=None, remote_post=None, preview=False):
-        if url is None and remote_post is None:
-            raise ValueError('either url or remote_post must be passed')
+    def download(self, id=None, remote_post=None, preview=False):
+        if id is None and remote_post is None:
+            raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             post_id = remote_post.original_id.split('-')[0]
             self.log.info('update request for %s', post_id)
             
         else:
-            self.log.info('download request for %s', url)
-            if url.isdigit():
-                post_id = url
+            self.log.info('download request for %s', id)
+            if id.isdigit():
+                post_id = id
                 
             else:
-                match = POST_REGEXP.match(url)
+                match = POST_REGEXP.match(id)
                 if not match:
-                    raise ValueError('unsupported url: {}'.format(repr(url)))
+                    raise ValueError('unsupported url: {}'.format(repr(id)))
                 
                 post_id = match.group('post_id')
         
@@ -496,6 +496,9 @@ class Fantia(PluginBase):
             thumbnail_url=fanclub.icon.main,
             related_urls=related_urls
         )
+    
+    def subscription_repr(self, options):
+        return 'posts:{}'.format(options.creator_id)
 
 Plugin = Fantia
 

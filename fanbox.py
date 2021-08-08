@@ -2,7 +2,6 @@
 
 import os
 import re
-import json
 from datetime import datetime, timedelta, timezone
 import dateutil.parser
 from tempfile import mkstemp
@@ -29,7 +28,7 @@ POST_REGEXP = [
     re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]*)\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 CREATOR_REGEXP = [
-    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
+    re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
     re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]+)(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 
@@ -70,6 +69,7 @@ class CreatorIterator(IteratorBase):
             update = True
         
         if update and self.subscription is not None:
+            self.subscription.repr = self.plugin.subscription_repr(self.options)
             self.subscription.options = self.options.to_json()
             self.plugin.core.add(self.subscription)
     
@@ -180,8 +180,9 @@ class Fanbox(PluginBase):
             if parameters is not None:
                 config.update(parameters)
                 
-                source.config = json.dumps(config)
+                source.config = config.to_json()
                 core.add(source)
+                core.commit()
         
         if not config.defined('FANBOXSESSID'):
             # but if they're still None, the api can't be used
@@ -268,9 +269,9 @@ class Fanbox(PluginBase):
             if remote_post is None:
                 self.log.info('creating new post')
                 
-                metadata = {}
+                metadata = hoordu.Dynamic()
                 if post.feeRequired != 0:
-                    metadata['price'] = post.feeRequired
+                    metadata.price = post.feeRequired
                 
                 remote_post = RemotePost(
                     source=self.source,
@@ -279,7 +280,7 @@ class Fanbox(PluginBase):
                     title=post.title,
                     type=PostType.collection,
                     post_time=post_time,
-                    metadata_=json.dumps(metadata)
+                    metadata_=metadata.to_json()
                 )
                 
                 if post.isLiked is True:
@@ -303,8 +304,10 @@ class Fanbox(PluginBase):
                 
                 self.core.add(remote_post)
         
+        current_files = {file.metadata_: file for file in remote_post.files}
+        current_urls = [r.url for r in remote_post.related]
+        
         if post.type == 'image':
-            current_files = {file.metadata_: file for file in remote_post.files}
             
             for image, order in zip(post.body.images, itertools.count(1)):
                 id = 'i-{}'.format(image.id)
@@ -335,8 +338,6 @@ class Fanbox(PluginBase):
             self.core.add(remote_post)
             
         elif post.type == 'file':
-            current_files = {file.metadata_: file for file in remote_post.files}
-            
             for rfile, order in zip(post.body.files, itertools.count(1)):
                 id = 'f-{}'.format(rfile.id)
                 file = current_files.get(id)
@@ -367,8 +368,6 @@ class Fanbox(PluginBase):
             self.core.add(remote_post)
             
         elif post.type == 'article':
-            current_files = {file.metadata_: file for file in remote_post.files}
-            
             imagemap = post.body.get('imageMap')
             filemap = post.body.get('fileMap')
             embedmap = post.body.get('embedMap')
@@ -377,7 +376,14 @@ class Fanbox(PluginBase):
             
             blog = []
             for block in post.body.blocks:
-                if block.type == 'p':
+                if block.type in ('p', 'header'):
+                    links = block.get('links')
+                    if links is not None:
+                        for link in links:
+                            url = link.url
+                            if url not in current_urls:
+                                remote_post.related.append(Related(url=url))
+                    
                     blog.append({
                         'type': 'text',
                         'content': block.text + '\n'
@@ -459,14 +465,18 @@ class Fanbox(PluginBase):
                     elif embed.serviceProvider == 'google_forms':
                         url = 'https://docs.google.com/forms/d/e/{}/viewform'.format(embed.contentId)
                         
+                    elif embed.serviceProvider == 'twitter':
+                        url = 'https://twitter.com/i/web/status/{}'.format(embed.contentId)
+                        
                     else:
                         raise NotImplementedError('unknown embed service provider: {}'.format(embed.serviceProvider))
                     
-                    remote_post.related.append(Related(url=url))
+                    if url not in current_urls:
+                        remote_post.related.append(Related(url=url))
                     
                     blog.append({
                         'type': 'text',
-                        'content': url
+                        'content': url + '\n'
                     })
                     
                 else:
@@ -486,29 +496,29 @@ class Fanbox(PluginBase):
         
         return remote_post
     
-    def download(self, url=None, remote_post=None, preview=False):
-        if url is None and remote_post is None:
-            raise ValueError('either url or remote_post must be passed')
+    def download(self, id=None, remote_post=None, preview=False):
+        if id is None and remote_post is None:
+            raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
-            post_id = remote_post.original_id.split('_')[0]
+            post_id = remote_post.original_id
             self.log.info('update request for %s', post_id)
             
         else:
-            self.log.info('download request for %s', url)
-            if url.isdigit():
-                post_id = url
+            self.log.info('download request for %s', id)
+            if id.isdigit():
+                post_id = id
                 
             else:
                 post_id = None
                 for regexp in POST_REGEXP:
-                    match = regexp.match(url)
+                    match = regexp.match(id)
                     if match:
                         post_id = match.group('post_id')
                         break
                 
                 if post_id is None:
-                    raise ValueError('unsupported url: {}'.format(repr(url)))
+                    raise ValueError('unsupported url: {}'.format(repr(id)))
         
         response = self.http.get(POST_GET_URL.format(post_id=post_id))
         response.raise_for_status()
@@ -548,6 +558,9 @@ class Fanbox(PluginBase):
             thumbnail_url=creator.user.iconUrl,
             related_urls=creator.profileLinks
         )
+    
+    def subscription_repr(self, options):
+        return 'posts:{}'.format(options.pixiv_id)
 
 Plugin = Fanbox
 
