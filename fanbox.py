@@ -28,8 +28,8 @@ POST_REGEXP = [
     re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]*)\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 CREATOR_REGEXP = [
+    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]+)(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
     re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
-    re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]+)(?:\/.*)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 
 POST_GET_URL = 'https://api.fanbox.cc/post.info?postId={post_id}'
