@@ -298,14 +298,34 @@ class Twitter(PluginBase):
             tweet_mode='extended'
         )
     
-    def _unwind_url(self, url, iterations=None):
+    def _unwind_url(self, url, iterations=20):
         final_url = url
+        scheme = re.compile('^https?:\/\/')
+        
         i = 0
         try:
             while url is not None:
                 resp = self.http.request('HEAD', url, redirect=False, timeout=10)
                 if resp.status // 100 == 3:
-                    url = resp.headers.get('Location')
+                    # check if relative url, append previous domain
+                    location = resp.headers.get('Location')
+                    
+                    if not scheme.match(location):
+                        if location.startswith('/'):
+                            # same domain absolute redirect
+                            match = scheme.match(url)
+                            main = url[:url.find('/', len(match[0]))]
+                            url = main + location
+                            
+                        else:
+                            # same domain relative redirect
+                            main = url[:url.rfind('/') + 1]
+                            url = main + location
+                        
+                    else:
+                        # different domain redirect
+                        url = location
+                    
                     if url is not None:
                         final_url = url
                 else:
