@@ -184,7 +184,7 @@ class GDrive(PluginBase):
         try:
             tokens = self.oauth.refresh_access_token(self.config.refresh_token)
         except OAuthError as e:
-            msg = hoordu.Dynamic.from_json(e.message)
+            msg = hoordu.Dynamic.from_json(str(e))
             if msg.error == 'invalid_grant':
                 self.core.rollback()
                 
