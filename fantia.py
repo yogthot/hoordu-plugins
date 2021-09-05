@@ -268,17 +268,22 @@ class Fantia(PluginBase):
                 self.core.import_file(file, orig=orig, thumb=thumb, move=True)
             
         elif content.category == 'photo_gallery':
-            current_files = {file.remote_order: file for file in remote_post.files}
+            current_files = {file.metadata_: file for file in remote_post.files}
             
+            order = 0
             for photo in content.post_content_photos:
-                order = int(photo.id)
-                file = current_files.get(order)
+                photo_id = str(photo.id)
+                file = current_files.get(photo_id)
                 
                 if file is None:
-                    file = File(remote=remote_post, remote_order=order)
+                    file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                     self.core.add(file)
                     self.core.flush()
                     self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
+                    
+                elif file.remote_order != order:
+                    file.remote_order = order
+                    self.core.add(file)
                 
                 need_orig = not file.present and not preview
                 need_thumb = not file.thumb_present
@@ -290,6 +295,8 @@ class Fantia(PluginBase):
                     thumb = self._download_file(photo.url.medium) if need_thumb else None
                     
                     self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                
+                order += 1
             
         elif content.category == 'text':
             # there are no files to save
