@@ -308,6 +308,7 @@ class Fantia(PluginBase):
             
             sections = hoordu.Dynamic.from_json(content.comment).ops
             blog = []
+            order = 0
             for section in sections:
                 insert = section.insert
                 if isinstance(insert, str):
@@ -319,11 +320,11 @@ class Fantia(PluginBase):
                 elif isinstance(insert, hoordu.Dynamic):
                     fantiaImage = insert.get('fantiaImage')
                     if fantiaImage is not None:
-                        order = int(fantiaImage.id)
-                        file = current_files.get(order)
+                        photo_id = str(fantiaImage.id)
+                        file = current_files.get(photo_id)
                         
                         if file is None:
-                            file = File(remote=remote_post, remote_order=order)
+                            file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                             self.core.add(file)
                             self.core.flush()
                             self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
@@ -344,8 +345,10 @@ class Fantia(PluginBase):
                         
                         blog.append({
                             'type': 'file',
-                            'order': order
+                            'metadata': photo_id
                         })
+                        
+                        order += 1
                         
                     else:
                         self.log.warning('unknown blog insert: %s', str(insert))

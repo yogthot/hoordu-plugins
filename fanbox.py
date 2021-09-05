@@ -419,7 +419,7 @@ class Fanbox(PluginBase):
                     
                     blog.append({
                         'type': 'file',
-                        'order': order
+                        'metadata': id
                     })
                     
                     order += 1
@@ -450,7 +450,7 @@ class Fanbox(PluginBase):
                     
                     blog.append({
                         'type': 'file',
-                        'order': order
+                        'metadata': id
                     })
                     
                     order += 1
