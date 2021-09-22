@@ -299,7 +299,7 @@ class GDrive(PluginBase):
             need_orig = not file.present and not preview
             
             if need_orig:
-                self.log.info('downloading files for post: %s, file: %r', remote_post.id)
+                self.log.info('downloading file for post: %s', remote_post.id)
                 
                 orig = self._download_file(node)
                 
@@ -326,7 +326,7 @@ class GDrive(PluginBase):
                 need_orig = not file.present and not preview
                 
                 if need_orig:
-                    self.log.info('downloading files for post: %s', remote_post.id)
+                    self.log.info('downloading file for post: %s', remote_post.id)
                     
                     orig = self._download_file(n)
                     
