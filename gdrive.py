@@ -104,8 +104,8 @@ class GDrive(PluginBase):
         )
     
     @classmethod
-    def init(cls, core, parameters=None):
-        source = core.source
+    def setup(cls, session, parameters=None):
+        source = cls.get_source(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -116,8 +116,7 @@ class GDrive(PluginBase):
                 config.update(parameters)
                 
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
         
         if not config.defined('client_id', 'client_secret'):
             # but if they're still None, the api can't be used
@@ -153,61 +152,41 @@ class GDrive(PluginBase):
                 config.access_token = response['access_token']
                 config.refresh_token = response['refresh_token']
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
                 
-                return True, cls(core)
+                return True, None
             
         else:
+            # TODO check if everything is working
+            
             # the config contains every required property
-            return True, cls(core)
+            return True, None
     
     @classmethod
-    def update(cls, core):
-        source = core.source
+    def update(cls, session):
+        source = cls.get_source(session)
         
         if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
             source.version = cls.version
-            core.add(source)
+            session.add(source)
     
-    def __init__(self, core, config=None):
-        super().__init__(core, config)
+    @classmethod
+    def parse_url(cls, url):
+        for regexp in FILE_REGEXP:
+            match = regexp.match(url)
+            if match:
+                return match.group('file_id')
+        
+        return None
+    
+    def __init__(self, session):
+        super().__init__(session)
         
         self.http = urllib3.PoolManager()
         
-        self._init_api()
-    
-    def _refresh_token(self):
-        try:
-            tokens = self.oauth.refresh_access_token(self.config.refresh_token)
-        except OAuthError as e:
-            msg = hoordu.Dynamic.from_json(str(e))
-            if msg.error == 'invalid_grant':
-                self.core.rollback()
-                
-                # refresh token expired or revoked
-                self.config.pop('access_token')
-                self.config.pop('refresh_token')
-                self.source.config = self.config.to_json()
-                self.core.add(self.source)
-                self.core.commit()
-            
-            raise
-        
-        access_token = tokens['access_token']
-        
-        # update access_token in the database
-        self.config.access_token = access_token
-        self.source.config = self.config.to_json()
-        self.core.add(self.source)
-        self.core.commit()
-        
-        return access_token
-    
-    def _init_api(self):
         self.oauth = OAuth({
             'auth_url': AUTH_URL,
             'token_url': TOKEN_URL,
@@ -219,13 +198,30 @@ class GDrive(PluginBase):
         
         self.api = Drive(self.config.access_token, self._refresh_token)
     
-    def parse_url(self, url):
-        for regexp in FILE_REGEXP:
-            match = regexp.match(url)
-            if match:
-                return match.group('file_id')
+    def _refresh_token(self):
+        try:
+            tokens = self.oauth.refresh_access_token(self.config.refresh_token)
+        except OAuthError as e:
+            msg = hoordu.Dynamic.from_json(str(e))
+            if msg.error == 'invalid_grant':
+                self.session.rollback()
+                
+                # refresh token expired or revoked
+                self.config.pop('access_token')
+                self.config.pop('refresh_token')
+                self.source.config = self.config.to_json()
+                self.session.add(self.source)
+            
+            raise
         
-        return None
+        access_token = tokens['access_token']
+        
+        # update access_token in the database
+        self.config.access_token = access_token
+        self.source.config = self.config.to_json()
+        self.session.add(self.source)
+        
+        return access_token
     
     def _ordered_walk(self, node, base_path=''):
         for n in natsorted(self.api.folder(node.id), key=lambda x: (self.api.is_dir(x), x.name.lower())):
@@ -241,14 +237,14 @@ class GDrive(PluginBase):
         headers = {'Authorization': f'Bearer {self.config.access_token}'}
         
         try:
-            return self.core.download(url, headers=headers, suffix=file.name)[0]
+            return self.session.download(url, headers=headers, suffix=file.name)[0]
             
         except HTTPError as e:
             if e.status == 401:
                 self.api.access_token = self._refresh_token()
                 headers = {'Authorization': f'Bearer {self.config.access_token}'}
                 
-                return self.core.download(url, headers=headers, suffix=file.name)[0]
+                return self.session.download(url, headers=headers, suffix=file.name)[0]
     
     def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
@@ -264,6 +260,7 @@ class GDrive(PluginBase):
         url = None
         if self.api.is_dir(node):
             url = FOLDER_FORMAT.format(file_id=node.id)
+            
         else:
             url = FILE_FORMAT.format(file_id=node.id)
         
@@ -280,7 +277,7 @@ class GDrive(PluginBase):
                     type=PostType.set,
                     post_time=create_time
                 )
-                self.core.add(remote_post)
+                self.session.add(remote_post)
                 
             else:
                 self.log.info('post already exists: %s', remote_post.id)
@@ -290,8 +287,8 @@ class GDrive(PluginBase):
         if not self.api.is_dir(node):
             if len(remote_post.files) == 0:
                 file = File(remote=remote_post, remote_order=1, filename=node.name)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 
             else:
                 file = remote_post.files[0]
@@ -303,7 +300,7 @@ class GDrive(PluginBase):
                 
                 orig = self._download_file(node)
                 
-                self.core.import_file(file, orig=orig, move=True)
+                self.session.import_file(file, orig=orig, move=True)
             
             return remote_post
         
@@ -314,14 +311,14 @@ class GDrive(PluginBase):
                 
                 if file is None:
                     file = File(remote=remote_post, remote_order=order, filename=path, metadata_=id)
-                    self.core.add(file)
-                    self.core.flush()
+                    self.session.add(file)
+                    self.session.flush()
                     self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.filename = path
                     file.remote_order = order
-                    self.core.add(file)
+                    self.session.add(file)
                 
                 need_orig = not file.present and not preview
                 
@@ -330,7 +327,7 @@ class GDrive(PluginBase):
                     
                     orig = self._download_file(n)
                     
-                    self.core.import_file(file, orig=orig, move=True)
+                    self.session.import_file(file, orig=orig, move=True)
             
             return remote_post
 

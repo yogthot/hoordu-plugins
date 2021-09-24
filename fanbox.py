@@ -41,7 +41,6 @@ class CreatorIterator(IteratorBase):
         super().__init__(fanbox, subscription=subscription, options=options)
         
         self.http = fanbox.http
-        self.log = fanbox.log
         
         self.options.pixiv_id = self.options.get('pixiv_id')
         
@@ -71,7 +70,7 @@ class CreatorIterator(IteratorBase):
         if update and self.subscription is not None:
             self.subscription.repr = self.plugin.subscription_repr(self.options)
             self.subscription.options = self.options.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
     
     def _post_iterator(self, direction=FetchDirection.newer, n=None):
         head = (direction == FetchDirection.newer)
@@ -147,7 +146,7 @@ class CreatorIterator(IteratorBase):
             if self.subscription is not None:
                 self.subscription.feed.append(remote_post)
             
-            self.plugin.core.commit()
+            self.session.commit()
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -155,7 +154,9 @@ class CreatorIterator(IteratorBase):
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
+        
+        self.session.commit()
 
 class Fanbox(PluginBase):
     name = 'fanbox'
@@ -169,8 +170,8 @@ class Fanbox(PluginBase):
         )
     
     @classmethod
-    def init(cls, core, parameters=None):
-        source = core.source
+    def setup(cls, session, parameters=None):
+        source = cls.get_source(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -181,8 +182,7 @@ class Fanbox(PluginBase):
                 config.update(parameters)
                 
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
         
         if not config.defined('FANBOXSESSID'):
             # but if they're still None, the api can't be used
@@ -190,38 +190,21 @@ class Fanbox(PluginBase):
             
         else:
             # the config contains every required property
-            return True, cls(core)
+            return True, None
     
     @classmethod
-    def update(cls, core):
-        source = core.source
+    def update(cls, session):
+        source = cls.get_source(session)
         
         if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
             source.version = cls.version
-            core.add(source)
+            session.add(source)
     
-    def __init__(self, core, config=None):
-        super().__init__(core, config)
-        
-        self._init_api()
-    
-    def _init_api(self):
-        self.http = requests.Session()
-        
-        self._headers = {
-            'Origin': 'https://www.fanbox.cc',
-            'Referer': 'https://www.fanbox.cc/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.config.FANBOXSESSID)
-        self.http.cookies.set_cookie(cookie)
-    
-    def parse_url(self, url):
+    @classmethod
+    def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -239,6 +222,21 @@ class Fanbox(PluginBase):
         
         return None
     
+    def __init__(self, session):
+        super().__init__(session)
+        
+        self.http = requests.Session()
+        
+        self._headers = {
+            'Origin': 'https://www.fanbox.cc',
+            'Referer': 'https://www.fanbox.cc/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+        }
+        self.http.headers.update(self._headers)
+        
+        cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.config.FANBOXSESSID)
+        self.http.cookies.set_cookie(cookie)
+    
     def _get_creator_id(self, pixiv_id):
         response = self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=pixiv_id), allow_redirects=False)
         creator_url = response.headers['Location']
@@ -250,7 +248,7 @@ class Fanbox(PluginBase):
         cookies = {
             'FANBOXSESSID': self.config.FANBOXSESSID
         }
-        path, resp = self.core.download(url, headers=self._headers, cookies=cookies)
+        path, resp = self.session.download(url, headers=self._headers, cookies=cookies)
         return path
     
     def _to_remote_post(self, post, remote_post=None, preview=False):
@@ -287,22 +285,22 @@ class Fanbox(PluginBase):
                     remote_post.favorite = True
                 
                 # creators are identified by their pixiv id because their name and creatorId can change
-                creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
+                creator_tag = self._get_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
                 
                 if any((creator_tag.update_metadata('name', creator_name),
                         creator_tag.update_metadata('slug', creator_slug))):
-                    self.core.add(creator_tag)
+                    self.session.add(creator_tag)
                 
                 for tag in post.tags:
-                    remote_tag = self.core.get_remote_tag(TagCategory.general, tag)
+                    remote_tag = self._get_tag(TagCategory.general, tag)
                     remote_post.tags.append(remote_tag)
                 
                 if post.hasAdultContent is True:
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
                 
-                self.core.add(remote_post)
+                self.session.add(remote_post)
         
         current_files = {file.metadata_: file for file in remote_post.files}
         current_urls = [r.url for r in remote_post.related]
@@ -315,13 +313,13 @@ class Fanbox(PluginBase):
                 
                 if file is None:
                     file = File(remote=remote_post, remote_order=order, metadata_=id)
-                    self.core.add(file)
-                    self.core.flush()
+                    self.session.add(file)
+                    self.session.flush()
                     self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.remote_order = order
-                    self.core.add(file)
+                    self.session.add(file)
                 
                 need_orig = not file.present and not preview
                 need_thumb = not file.thumb_present
@@ -332,10 +330,10 @@ class Fanbox(PluginBase):
                     orig = self._download_file(image.originalUrl) if need_orig else None
                     thumb = self._download_file(image.thumbnailUrl) if need_thumb else None
                     
-                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
             
             remote_post.comment = post.body.text
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         elif post.type == 'file':
             for rfile, order in zip(post.body.files, itertools.count(1)):
@@ -345,13 +343,13 @@ class Fanbox(PluginBase):
                 if file is None:
                     filename = '{0.name}.{0.extension}'.format(rfile)
                     file = File(remote=remote_post, remote_order=order, filename=filename, metadata_=id)
-                    self.core.add(file)
-                    self.core.flush()
+                    self.session.add(file)
+                    self.session.flush()
                     self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.remote_order = order
-                    self.core.add(file)
+                    self.session.add(file)
                 
                 need_orig = not file.present and not preview
                 need_thumb = not file.thumb_present and post.coverImageUrl is not None
@@ -362,10 +360,10 @@ class Fanbox(PluginBase):
                     orig = self._download_file(rfile.url) if need_orig else None
                     thumb = self._download_file(post.coverImageUrl) if need_thumb else None
                     
-                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
             
             remote_post.comment = post.body.text
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         elif post.type == 'article':
             imagemap = post.body.get('imageMap')
@@ -395,13 +393,13 @@ class Fanbox(PluginBase):
                     
                     if file is None:
                         file = File(remote=remote_post, remote_order=order, metadata_=id)
-                        self.core.add(file)
-                        self.core.flush()
+                        self.session.add(file)
+                        self.session.flush()
                         self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                         
                     else:
                         file.remote_order = order
-                        self.core.add(file)
+                        self.session.add(file)
                     
                     orig_url = imagemap[block.imageId].originalUrl
                     thumb_url = imagemap[block.imageId].thumbnailUrl
@@ -415,7 +413,7 @@ class Fanbox(PluginBase):
                         orig = self._download_file(orig_url) if need_orig else None
                         thumb = self._download_file(thumb_url) if need_thumb else None
                         
-                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                     
                     blog.append({
                         'type': 'file',
@@ -430,8 +428,8 @@ class Fanbox(PluginBase):
                     
                     if file is None:
                         file = File(remote=remote_post, remote_order=order, metadata_=id)
-                        self.core.add(file)
-                        self.core.flush()
+                        self.session.add(file)
+                        self.session.flush()
                         self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                     orig_url = filemap[block.fileId].url
@@ -446,7 +444,7 @@ class Fanbox(PluginBase):
                         orig = self._download_file(orig_url) if need_orig else None
                         thumb = self._download_file(thumb_url) if need_thumb else None
                         
-                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                     
                     blog.append({
                         'type': 'file',
@@ -484,12 +482,12 @@ class Fanbox(PluginBase):
             
             remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
             remote_post.type = PostType.blog
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         elif post.type == 'text':
             remote_post.comment = post.body.text
             remote_post.type = PostType.set
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         else:
             raise NotImplementedError('unknown post type: {}'.format(post.type))
@@ -501,26 +499,10 @@ class Fanbox(PluginBase):
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
-            post_id = remote_post.original_id
-            self.log.info('update request for %s', post_id)
-            
-        else:
-            self.log.info('download request for %s', id)
-            if id.isdigit():
-                post_id = id
-                
-            else:
-                post_id = None
-                for regexp in POST_REGEXP:
-                    match = regexp.match(id)
-                    if match:
-                        post_id = match.group('post_id')
-                        break
-                
-                if post_id is None:
-                    raise ValueError('unsupported url: {}'.format(repr(id)))
+            id = remote_post.original_id
+            self.log.info('update request for %s', id)
         
-        response = self.http.get(POST_GET_URL.format(post_id=post_id))
+        response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()
         post = hoordu.Dynamic.from_json(response.text).body
         self.log.debug('post json: %s', post)

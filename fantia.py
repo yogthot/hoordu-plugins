@@ -32,7 +32,6 @@ class CreatorIterator(IteratorBase):
         super().__init__(fantia, subscription=subscription, options=options)
         
         self.http = fantia.http
-        self.log = fantia.log
         
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
@@ -100,11 +99,13 @@ class CreatorIterator(IteratorBase):
                 for p in remote_posts:
                     self.subscription.feed.append(p)
             
-            self.plugin.core.commit()
+            self.session.commit()
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
+        
+        self.session.commit()
 
 class Fantia(PluginBase):
     name = 'fantia'
@@ -118,8 +119,8 @@ class Fantia(PluginBase):
         )
     
     @classmethod
-    def init(cls, core, parameters=None):
-        source = core.source
+    def setup(cls, session, parameters=None):
+        source = cls.get_source(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -130,8 +131,7 @@ class Fantia(PluginBase):
                 config.update(parameters)
                 
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
         
         if not config.defined('session_id'):
             # but if they're still None, the api can't be used
@@ -139,38 +139,21 @@ class Fantia(PluginBase):
             
         else:
             # the config contains every required property
-            return True, cls(core)
+            return True, None
     
     @classmethod
-    def update(cls, core):
-        source = core.source
+    def update(cls, session):
+        source = cls.get_source(session)
         
         if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
             source.version = cls.version
-            core.add(source)
+            session.add(source)
     
-    def __init__(self, core, config=None):
-        super().__init__(core, config)
-        
-        self._init_api()
-    
-    def _init_api(self):
-        self.http = requests.Session()
-        
-        self._headers = {
-            'Origin': 'https://fantia.jp/',
-            'Referer': 'https://fantia.jp/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        cookie = requests.cookies.create_cookie(name='_session_id', value=self.config.session_id)
-        self.http.cookies.set_cookie(cookie)
-    
-    def parse_url(self, url):
+    @classmethod
+    def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -186,11 +169,26 @@ class Fantia(PluginBase):
         
         return None
     
+    def __init__(self, session):
+        super().__init__(session)
+        
+        self.http = requests.Session()
+        
+        self._headers = {
+            'Origin': 'https://fantia.jp/',
+            'Referer': 'https://fantia.jp/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+        }
+        self.http.headers.update(self._headers)
+        
+        cookie = requests.cookies.create_cookie(name='_session_id', value=self.config.session_id)
+        self.http.cookies.set_cookie(cookie)
+    
     def _download_file(self, url, filename=None):
         cookies = {
             '_session_id': self.config.session_id
         }
-        path, resp = self.core.download(url, headers=self._headers, cookies=cookies, suffix=filename)
+        path, resp = self.session.download(url, headers=self._headers, cookies=cookies, suffix=filename)
         return path
     
     def _content_to_post(self, post, content, remote_post=None, preview=False):
@@ -227,27 +225,27 @@ class Fantia(PluginBase):
                     remote_post.favorite = True
                 
                 # creators are identified by their id because their name can change
-                creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
+                creator_tag = self._get_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
                 
                 if creator_tag.update_metadata('name', creator_name):
-                    self.core.add(creator_tag)
+                    self.session.add(creator_tag)
                 
                 for tag in post.tags:
-                    remote_tag = self.core.get_remote_tag(TagCategory.general, tag.name)
+                    remote_tag = self._get_tag(TagCategory.general, tag.name)
                     remote_post.tags.append(remote_tag)
                 
                 if post.rating == 'adult':
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
                 
-                self.core.add(remote_post)
+                self.session.add(remote_post)
         
         if content.category == 'file':
             if len(remote_post.files) == 0:
                 file = File(remote=remote_post, remote_order=0, filename=content.filename)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 self.log.info('found new file for post %s, filename: %s', remote_post.id, content.filename)
             else:
                 file = remote_post.files[0]
@@ -265,7 +263,7 @@ class Fantia(PluginBase):
                 else:
                     thumb = None
                 
-                self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
             
         elif content.category == 'photo_gallery':
             current_files = {file.metadata_: file for file in remote_post.files}
@@ -277,13 +275,13 @@ class Fantia(PluginBase):
                 
                 if file is None:
                     file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
-                    self.core.add(file)
-                    self.core.flush()
+                    self.session.add(file)
+                    self.session.flush()
                     self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 elif file.remote_order != order:
                     file.remote_order = order
-                    self.core.add(file)
+                    self.session.add(file)
                 
                 need_orig = not file.present and not preview
                 need_thumb = not file.thumb_present
@@ -294,14 +292,14 @@ class Fantia(PluginBase):
                     orig = self._download_file(photo.url.original) if need_orig else None
                     thumb = self._download_file(photo.url.medium) if need_thumb else None
                     
-                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                 
                 order += 1
             
         elif content.category == 'text':
             # there are no files to save
             remote_post.type = PostType.set
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         elif content.category == 'blog':
             current_files = {file.remote_order: file for file in remote_post.files}
@@ -325,8 +323,8 @@ class Fantia(PluginBase):
                         
                         if file is None:
                             file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
-                            self.core.add(file)
-                            self.core.flush()
+                            self.session.add(file)
+                            self.session.flush()
                             self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                         
                         orig_url = FILE_DOWNLOAD_URL.format(download_uri=fantiaImage.original_url)
@@ -341,7 +339,7 @@ class Fantia(PluginBase):
                             orig = self._download_file(orig_url) if need_orig else None
                             thumb = self._download_file(thumb_url) if need_thumb else None
                             
-                            self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         
                         blog.append({
                             'type': 'file',
@@ -355,7 +353,7 @@ class Fantia(PluginBase):
             
             remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
             remote_post.type = PostType.blog
-            self.core.add(remote_post)
+            self.session.add(remote_post)
             
         else:
             raise NotImplementedError('unknown content category: {}'.format(content.category))
@@ -402,29 +400,29 @@ class Fantia(PluginBase):
                     remote_post.favorite = True
                 
                 # creators are identified by their id because their name can change
-                creator_tag = self.core.get_remote_tag(TagCategory.artist, creator_id)
+                creator_tag = self._get_tag(TagCategory.artist, creator_id)
                 remote_post.tags.append(creator_tag)
                 
                 if creator_tag.update_metadata('name', creator_name):
-                    self.core.add(creator_tag)
+                    self.session.add(creator_tag)
                 
                 for tag in post.tags:
-                    remote_tag = self.core.get_remote_tag(TagCategory.general, tag.name)
+                    remote_tag = self._get_tag(TagCategory.general, tag.name)
                     remote_post.tags.append(remote_tag)
                 
                 if post.rating == 'adult':
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
                 
                 
-                self.core.add(remote_post)
+                self.session.add(remote_post)
         
         # download thumbnail if there is one
         if len(remote_post.files) == 0:
             if post.thumb is not None:
                 file = File(remote=remote_post, remote_order=0)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
             else:
                 file = None
         else:
@@ -437,7 +435,7 @@ class Fantia(PluginBase):
                 self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
                 orig = self._download_file(post.thumb.original) if need_orig else None
                 thumb = self._download_file(post.thumb.medium) if need_thumb else None
-                self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         # convert the post contents to posts as well
         remote_posts = [remote_post]
@@ -445,7 +443,7 @@ class Fantia(PluginBase):
             if content.visible_status == 'visible':
                 content_post = self._content_to_post(post, content, preview=preview)
                 remote_posts.append(content_post)
-                self.core.flush()
+                self.session.flush()
                 rel = self.session.query(Related).filter(Related.related_to_id == remote_post.id, Related.remote_id == content_post.id).one_or_none()
                 if rel is None:
                     remote_post.related.append(Related(remote=content_post))
@@ -457,22 +455,10 @@ class Fantia(PluginBase):
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
-            post_id = remote_post.original_id.split('-')[0]
-            self.log.info('update request for %s', post_id)
-            
-        else:
-            self.log.info('download request for %s', id)
-            if id.isdigit():
-                post_id = id
-                
-            else:
-                match = POST_REGEXP.match(id)
-                if not match:
-                    raise ValueError('unsupported url: {}'.format(repr(id)))
-                
-                post_id = match.group('post_id')
+            id = remote_post.original_id.split('-')[0]
+            self.log.info('update request for %s', id)
         
-        response = self.http.get(POST_GET_URL.format(post_id=post_id))
+        response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()
         post = hoordu.Dynamic.from_json(response.text).post
         self.log.debug('post json: %s', post)

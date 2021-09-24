@@ -47,7 +47,6 @@ class IllustIterator(IteratorBase):
         super().__init__(pixiv, subscription=subscription, options=options)
         
         self.http = pixiv.http
-        self.log = pixiv.log
         
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
@@ -109,21 +108,19 @@ class IllustIterator(IteratorBase):
             if self.subscription is not None:
                 self.subscription.feed.append(post)
             
-            # always commit changes
-            # RemotePost, RemoteTag and the subscription feed are simply a cache
-            # the file downloads are more expensive than a call to the database
-            self.plugin.core.commit()
+            self.session.commit()
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
+        
+        self.session.commit()
 
 class BookmarkIterator(IteratorBase):
     def __init__(self, pixiv, subscription=None, options=None):
         super().__init__(pixiv, subscription=subscription, options=options)
         
         self.http = pixiv.http
-        self.log = pixiv.log
         
         self.first_id = None
         self.state.head_id = self.state.get('head_id')
@@ -221,7 +218,7 @@ class BookmarkIterator(IteratorBase):
             if self.subscription is not None:
                 self.subscription.feed.append(post)
             
-            self.plugin.core.commit()
+            self.session.commit()
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -229,7 +226,9 @@ class BookmarkIterator(IteratorBase):
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
+        
+        self.session.commit()
 
 class Pixiv(PluginBase):
     name = 'pixiv'
@@ -242,8 +241,8 @@ class Pixiv(PluginBase):
         )
     
     @classmethod
-    def init(cls, core, parameters=None):
-        source = core.source
+    def setup(cls, session, parameters=None):
+        source = cls.get_source(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -254,8 +253,7 @@ class Pixiv(PluginBase):
                 config.update(parameters)
                 
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
         
         if not config.defined('PHPSESSID'):
             # but if they're still None, the api can't be used
@@ -263,36 +261,21 @@ class Pixiv(PluginBase):
             
         else:
             # the config contains every required property
-            return True, cls(core)
+            return True, None
     
     @classmethod
-    def update(cls, core):
-        source = core.source
+    def update(cls, session):
+        source = cls.get_source(session)
         
         if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
             source.version = cls.version
-            core.add(source)
+            session.add(source)
     
-    def __init__(self, core, config=None):
-        super().__init__(core, config)
-        
-        self._init_api()
-    
-    def _init_api(self):
-        self.http = requests.Session()
-        
-        self._headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        cookie = requests.cookies.create_cookie(name='PHPSESSID', value=self.config.PHPSESSID)
-        self.http.cookies.set_cookie(cookie)
-    
-    def parse_url(self, url):
+    @classmethod
+    def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -319,6 +302,19 @@ class Pixiv(PluginBase):
         
         return None
     
+    def __init__(self, session):
+        super().__init__(session)
+        
+        self.http = requests.Session()
+        
+        self._headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+        }
+        self.http.headers.update(self._headers)
+        
+        cookie = requests.cookies.create_cookie(name='PHPSESSID', value=self.config.PHPSESSID)
+        self.http.cookies.set_cookie(cookie)
+    
     def _download_file(self, url):
         cookies = {
             'PHPSESSID': self.config.PHPSESSID
@@ -327,7 +323,7 @@ class Pixiv(PluginBase):
         headers = dict(self._headers)
         headers['Referer'] = 'https://www.pixiv.net/'
         
-        path, resp = self.core.download(url, headers=headers, cookies=cookies)
+        path, resp = self.session.download(url, headers=headers, cookies=cookies)
         return path
     
     def _parse_href(self, page_url, href):
@@ -399,40 +395,40 @@ class Pixiv(PluginBase):
                 if post.likeData:
                     remote_post.favorite = True
                 
-                user_tag = self.core.get_remote_tag(TagCategory.artist, user_id)
+                user_tag = self._get_tag(TagCategory.artist, user_id)
                 remote_post.tags.append(user_tag)
                 
                 if any((user_tag.update_metadata('name', user_name),
                         user_tag.update_metadata('account', user_account))):
-                    self.core.add(user_tag)
+                    self.session.add(user_tag)
                 
                 for tag in post.tags.tags:
-                    remote_tag = self.core.get_remote_tag(TagCategory.general, tag.tag)
+                    remote_tag = self.session._get_tag(TagCategory.general, tag.tag)
                     remote_post.tags.append(remote_tag)
                     if tag.defined('romaji'):
                         tag_metadata = hoordu.Dynamic.from_json(remote_tag.metadata_)
                         if tag_metadata.get('romaji', None) != tag.romaji:
                             tag_metadata.romaji = tag.romaji
                             remote_tag.metadata_ = tag_metadata.to_json()
-                            self.core.add(remote_tag)
+                            self.session.add(remote_tag)
                     
                 
                 if post.xRestrict >= 1:
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
                     
                 if post.xRestrict >= 2:
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'extreme')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'extreme')
                     remote_post.tags.append(nsfw_tag)
                 
                 if post.isOriginal:
-                    original_tag = self.core.get_remote_tag(TagCategory.copyright, 'original')
+                    original_tag = self._get_tag(TagCategory.copyright, 'original')
                     remote_post.tags.append(original_tag)
                 
                 for url in urls:
                     remote_post.related.append(Related(url=url))
                 
-                self.core.add(remote_post)
+                self.session.add(remote_post)
         
         if post.illustType == 2:
             # ugoira
@@ -441,8 +437,8 @@ class Pixiv(PluginBase):
                 
             else:
                 file = File(remote=remote_post, remote_order=0)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 self.log.info('found new file for post %s, file order: %s', remote_post.id, 0)
             
             need_orig = not file.present and not preview
@@ -460,11 +456,11 @@ class Pixiv(PluginBase):
                     orig = self._download_file(ugoira_meta.originalSrc)
                     
                     if file.update_metadata('frames', ugoira_meta.frames):
-                        self.core.add(file)
+                        self.session.add(file)
                 
                 thumb = self._download_file(post.urls.small) if need_thumb else None
                 
-                self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
             
         elif post.pageCount == 1:
             # single page illust
@@ -473,8 +469,8 @@ class Pixiv(PluginBase):
                 
             else:
                 file = File(remote=remote_post, remote_order=0)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 self.log.info('found new file for post %s, file order: %s', remote_post.id, 0)
             
             need_orig = not file.present and not preview
@@ -486,7 +482,7 @@ class Pixiv(PluginBase):
                 orig = self._download_file(post.urls.original) if need_orig else None
                 thumb = self._download_file(post.urls.small) if need_thumb else None
                 
-                self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
             
         else:
             # multi page illust or manga
@@ -495,8 +491,8 @@ class Pixiv(PluginBase):
             
             for order in available - present:
                 file = File(remote=remote_post, remote_order=order)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
             
             response = self.http.get(POST_PAGES_URL.format(post_id=post_id))
@@ -513,7 +509,7 @@ class Pixiv(PluginBase):
                     orig = self._download_file(pages[file.remote_order].urls.original) if need_orig else None
                     thumb = self._download_file(pages[file.remote_order].urls.small) if need_thumb else None
                     
-                    self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         return remote_post
     
@@ -522,26 +518,10 @@ class Pixiv(PluginBase):
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
-            post_id = remote_post.original_id
-            self.log.info('update request for %s', post_id)
-            
-        else:
-            self.log.info('download request for %s', id)
-            if id.isdigit():
-                post_id = id
-                
-            else:
-                post_id = None
-                for regexp in POST_REGEXP:
-                    match = regexp.match(id)
-                    if match:
-                        post_id = match.group('post_id')
-                        break
-                
-                if post_id is None:
-                    raise ValueError('unsupported id: {}'.format(repr(id)))
+            id = remote_post.original_id
+            self.log.info('update request for %s', id)
         
-        response = self.http.get(POST_GET_URL.format(post_id=post_id))
+        response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()
         post = hoordu.Dynamic.from_json(response.text)
         self.log.debug('post json: %s', post)

@@ -67,11 +67,10 @@ def oauth_finish(consumer_key, consumer_secret, oauth_token, oauth_token_secret,
     return access_token_key, access_token_secret
 
 class TweetIterator(IteratorBase):
-    def __init__(self, twitter, subscription=None, options=None):
-        super().__init__(twitter, subscription=subscription, options=options)
+    def __init__(self, plugin, subscription=None, options=None):
+        super().__init__(plugin, subscription=subscription, options=options)
         
-        self.api = twitter.api
-        self.log = twitter.log
+        self.api = plugin.api
         
         self.options.user_id = self.options.get('user_id')
         
@@ -87,7 +86,7 @@ class TweetIterator(IteratorBase):
             
             if self.subscription is not None:
                 self.subscription.options = self.options.to_json()
-                self.twitter.core.add(self.subscription)
+                self.session.add(self.subscription)
     
     def _page_iterator(self, method, limit=None, max_id=None, **kwargs):
         total = 0
@@ -180,7 +179,7 @@ class TweetIterator(IteratorBase):
                 if self.subscription is not None:
                     self.subscription.feed.append(remote_post)
                 
-                self.plugin.core.commit()
+                self.session.commit()
             
             if direction == FetchDirection.older:
                 self.state.tail_id = tweet.id_str
@@ -193,7 +192,9 @@ class TweetIterator(IteratorBase):
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
-            self.plugin.core.add(self.subscription)
+            self.session.add(self.subscription)
+        
+        self.session.commit()
 
 class Twitter(PluginBase):
     name = 'twitter'
@@ -210,8 +211,8 @@ class Twitter(PluginBase):
         )
     
     @classmethod
-    def init(cls, core, parameters=None):
-        source = core.source
+    def setup(cls, session, parameters=None):
+        source = cls.get_source(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(source.config)
@@ -222,8 +223,7 @@ class Twitter(PluginBase):
                 config.update(parameters)
                 
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
         
         if not config.defined('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
@@ -240,8 +240,7 @@ class Twitter(PluginBase):
                 config.oauth_token = oauth_token
                 config.oauth_token_secret = oauth_token_secret
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
                 
                 oauth_form = Form('twitter authentication',
                     Label('please login to twitter via this url to get your pin:\n{}'.format(url)),
@@ -262,34 +261,55 @@ class Twitter(PluginBase):
                 config.access_token_key = access_token_key
                 config.access_token_secret = access_token_secret
                 source.config = config.to_json()
-                core.add(source)
-                core.commit()
+                session.add(source)
                 
-                return True, cls(core)
+                return True, None
             
         else:
             # the config contains every required property
-            return True, cls(core)
+            return True, None
     
     @classmethod
-    def update(cls, core):
-        source = core.source
+    def update(cls, session):
+        source = cls.get_source(session)
         
         if source.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
             source.version = cls.version
-            core.add(source)
+            session.add(source)
     
-    def __init__(self, core, config=None):
-        super().__init__(core, config)
+    @classmethod
+    def parse_url(cls, url):
+        if url.isdigit():
+            return url
+        
+        for regexp in TWEET_REGEXP:
+            match = regexp.match(url)
+            if match:
+                return match.group('tweet_id')
+        
+        match = TIMELINE_REGEXP.match(url)
+        if match:
+            user = match.group('user')
+            method = match.group('type')
+            
+            if method != 'likes':
+                method = 'tweets'
+            
+            return hoordu.Dynamic({
+                'user': user,
+                'method': method
+            })
+        
+        return None
+    
+    def __init__(self, session):
+        super().__init__(session)
         
         self.http = urllib3.PoolManager()
         
-        self._init_api()
-    
-    def _init_api(self):
         self.api = twitter.Api(
             consumer_key=self.config.consumer_key,
             consumer_secret=self.config.consumer_secret,
@@ -340,33 +360,8 @@ class Twitter(PluginBase):
         
         return final_url
     
-    
-    def parse_url(self, url):
-        if url.isdigit():
-            return url
-        
-        for regexp in TWEET_REGEXP:
-            match = regexp.match(url)
-            if match:
-                return match.group('tweet_id')
-        
-        match = TIMELINE_REGEXP.match(url)
-        if match:
-            user = match.group('user')
-            method = match.group('type')
-            
-            if method != 'likes':
-                method = 'tweets'
-            
-            return hoordu.Dynamic({
-                'user': user,
-                'method': method
-            })
-        
-        return None
-    
     def _download_media_file(self, base_url, ext, size, filename=None):
-        return self.core.download(MEDIA_URL.format(base_url=base_url, ext=ext, size=size), suffix=filename)[0]
+        return self.session.download(MEDIA_URL.format(base_url=base_url, ext=ext, size=size), suffix=filename)[0]
     
     def _download_video(self, media):
         variants = media.video_info.get('variants', [])
@@ -378,7 +373,7 @@ class Twitter(PluginBase):
         )
         
         if variant is not None:
-            path, resp = self.core.download(variant['url'])
+            path, resp = self.session.download(variant['url'])
             return path
         else:
             return None
@@ -411,22 +406,22 @@ class Twitter(PluginBase):
                     metadata_=hoordu.Dynamic({'user': user}).to_json()
                 )
                 
-                user_tag = self.core.get_remote_tag(TagCategory.artist, user_id)
+                user_tag = self._get_tag(TagCategory.artist, user_id)
                 remote_post.tags.append(user_tag)
                 
                 if user_tag.update_metadata('user', user):
-                    self.core.add(user_tag)
+                    self.session.add(user_tag)
                 
                 remote_post.favorite = tweet.favorited is True
                 
                 if tweet.possibly_sensitive:
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
                 
                 if tweet.hashtags is not None:
                     for hashtag in tweet.hashtags:
                         tag = hashtag.text
-                        nsfw_tag = self.core.get_remote_tag(TagCategory.general, tag)
+                        nsfw_tag = self._get_tag(TagCategory.general, tag)
                         remote_post.tags.append(nsfw_tag)
                 
                 if tweet.in_reply_to_status_id is not None:
@@ -443,7 +438,7 @@ class Twitter(PluginBase):
                         final_url = self._unwind_url(url.url)
                         remote_post.related.append(Related(url=final_url))
                 
-                self.core.add(remote_post)
+                self.session.add(remote_post)
                 
             else:
                 self.log.info('post already exists: %s', remote_post.id)
@@ -461,14 +456,14 @@ class Twitter(PluginBase):
             
             if tweet.possibly_sensitive:
                 if (TagCategory.meta, 'nsfw') not in existing_tags:
-                    nsfw_tag = self.core.get_remote_tag(TagCategory.meta, 'nsfw')
+                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
                     remote_post.tags.append(nsfw_tag)
             
             if tweet.hashtags is not None:
                 for hashtag in tweet.hashtags:
                     tag = hashtag.text
                     if (TagCategory.general, tag) not in existing_tags:
-                        nsfw_tag = self.core.get_remote_tag(TagCategory.general, tag)
+                        nsfw_tag = self._get_tag(TagCategory.general, tag)
                         remote_post.tags.append(nsfw_tag)
             
             if tweet.in_reply_to_status_id is not None:
@@ -487,7 +482,7 @@ class Twitter(PluginBase):
                     if final_url not in existing_urls:
                         remote_post.related.append(Related(url=final_url))
             
-            self.core.add(remote_post)
+            self.session.add(remote_post)
         
         if tweet.media is not None:
             available = set(range(len(tweet.media)))
@@ -495,8 +490,8 @@ class Twitter(PluginBase):
             
             for order in available - present:
                 file = File(remote=remote_post, remote_order=order)
-                self.core.add(file)
-                self.core.flush()
+                self.session.add(file)
+                self.session.flush()
                 self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
             
             for file in remote_post.files:
@@ -520,10 +515,10 @@ class Twitter(PluginBase):
                         if need_file:
                             orig = self._download_media_file(base_url, ext, ORIG_SIZE, filename)
                         
-                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         file.ext = ext
                         file.thumb_ext = ext
-                        self.core.add(file)
+                        self.session.add(file)
                         
                     elif media.type == 'video' or media.type == 'animated_gif':
                         if need_thumb:
@@ -532,9 +527,9 @@ class Twitter(PluginBase):
                         if need_file:
                             orig = self._download_video(media)
                         
-                        self.core.import_file(file, orig=orig, thumb=thumb, move=True)
+                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         file.thumb_ext = ext
-                        self.core.add(file)
+                        self.session.add(file)
         
         return remote_post
     
@@ -543,26 +538,10 @@ class Twitter(PluginBase):
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
-            tweet_id = remote_post.original_id
-            self.log.info('update request for %s', tweet_id)
-            
-        else:
-            self.log.info('download request for %s', id)
-            if id.isdigit():
-                tweet_id = id
-                
-            else:
-                tweet_id = None
-                for regexp in TWEET_REGEXP:
-                    match = regexp.match(id)
-                    if match:
-                        tweet_id = match.group('tweet_id')
-                        break
-                
-                if tweet_id is None:
-                    raise ValueError('unsupported url: {}'.format(repr(id)))
+            id = remote_post.original_id
+            self.log.info('update request for %s', id)
         
-        tweet = self.api.GetStatus(tweet_id)
+        tweet = self.api.GetStatus(id)
         self.log.debug('tweet: %s', tweet)
         
         return self.tweet_to_remote_post(tweet, remote_post=remote_post, preview=preview)
