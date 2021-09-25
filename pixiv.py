@@ -403,7 +403,7 @@ class Pixiv(PluginBase):
                     self.session.add(user_tag)
                 
                 for tag in post.tags.tags:
-                    remote_tag = self.session._get_tag(TagCategory.general, tag.tag)
+                    remote_tag = self._get_tag(TagCategory.general, tag.tag)
                     remote_post.tags.append(remote_tag)
                     if tag.defined('romaji'):
                         tag_metadata = hoordu.Dynamic.from_json(remote_tag.metadata_)
