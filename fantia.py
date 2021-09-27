@@ -36,8 +36,14 @@ class CreatorIterator(IteratorBase):
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
     
-    def _post_iterator(self, direction=FetchDirection.newer, n=None):
-        post_id = self.state.head_id if direction == FetchDirection.newer else self.state.tail_id
+    def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
+        if self.state.tail_id is None:
+            direction = FetchDirection.older
+        
+        super().reconfigure(direction=direction, num_posts=num_posts)
+    
+    def _post_iterator(self):
+        post_id = self.state.head_id if self.direction == FetchDirection.newer else self.state.tail_id
         
         if post_id is None:
             response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id))
@@ -59,14 +65,14 @@ class CreatorIterator(IteratorBase):
             response.raise_for_status()
             post = hoordu.Dynamic.from_json(response.text).post
             
-            next_post = post.links.next if direction == FetchDirection.newer else post.links.previous
+            next_post = post.links.next if self.direction == FetchDirection.newer else post.links.previous
             if next_post is None:
                 return
             
             post_id = next_post.id
         
         # iter(int, 1) -> infinite iterator
-        it = range(n) if n is not None else iter(int, 1)
+        it = range(self.num_posts) if self.num_posts is not None else iter(int, 1)
         for _ in it:
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
             response.raise_for_status()
@@ -75,22 +81,19 @@ class CreatorIterator(IteratorBase):
             
             yield post
             
-            if direction == FetchDirection.newer:
+            if self.direction == FetchDirection.newer:
                 self.state.head_id = post_id
-            elif direction == FetchDirection.older:
+            elif self.direction == FetchDirection.older:
                 self.state.tail_id = post_id
             
-            next_post = post.links.next if direction == FetchDirection.newer else post.links.previous
+            next_post = post.links.next if self.direction == FetchDirection.newer else post.links.previous
             if next_post is None:
                 break
             
             post_id = next_post.id
     
-    def fetch(self, direction=FetchDirection.newer, n=None):
-        if self.state.tail_id is None:
-            direction = FetchDirection.older
-        
-        for post in self._post_iterator(direction, n):
+    def _generator(self):
+        for post in self._post_iterator():
             remote_posts = self.plugin._to_remote_posts(post, preview=self.subscription is None)
             for remote_post in remote_posts:
                 yield remote_post

@@ -51,7 +51,7 @@ class IllustIterator(IteratorBase):
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
     
-    def _iterator(self, direction=FetchDirection.newer, n=None):
+    def _iterator(self):
         response = self.http.get(USER_POSTS_URL.format(user_id=self.options.user_id))
         response.raise_for_status()
         user_info = hoordu.Dynamic.from_json(response.text)
@@ -68,17 +68,17 @@ class IllustIterator(IteratorBase):
                 posts.extend(body[bucket].keys())
         
         if self.state.tail_id is None:
-            direction = FetchDirection.older
+            self.direction = FetchDirection.older
             posts = sorted(posts, reverse=True)
             
-        elif direction == FetchDirection.newer:
+        elif self.direction == FetchDirection.newer:
             posts = sorted([id for id in posts if id > self.state.head_id])
             
         else:
             posts = sorted([id for id in posts if id < self.state.tail_id], reverse=True)
         
-        if n is not None:
-            posts = posts[:n]
+        if self.num_posts is not None:
+            posts = posts[:self.num_posts]
         
         for post_id in posts:
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
@@ -96,13 +96,13 @@ class IllustIterator(IteratorBase):
             remote_post = self.plugin._to_remote_post(post.body, preview=self.subscription is None)
             yield remote_post
             
-            if direction == FetchDirection.newer:
+            if self.direction == FetchDirection.newer:
                 self.state.head_id = post_id
-            elif direction == FetchDirection.older:
+            elif self.direction == FetchDirection.older:
                 self.state.tail_id = post_id
     
-    def fetch(self, direction=FetchDirection.newer, n=None):
-        for post in self._iterator(direction, n):
+    def _generator(self):
+        for post in self._iterator():
             yield post
             
             if self.subscription is not None:
@@ -127,8 +127,17 @@ class BookmarkIterator(IteratorBase):
         self.state.tail_id = self.state.get('tail_id')
         self.state.offset = self.state.get('offset', 0)
     
-    def _iterator(self, direction=FetchDirection.newer, n=None):
-        head = (direction == FetchDirection.newer)
+    def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
+        if direction == FetchDirection.newer:
+            if self.state.tail_id is None:
+                direction = FetchDirection.older
+            else:
+                num_posts = None
+        
+        super().reconfigure(direction=direction, num_posts=num_posts)
+    
+    def _iterator(self):
+        head = (self.direction == FetchDirection.newer)
         head_id = self.state.head_id
         tail_id = self.state.tail_id
         
@@ -140,7 +149,7 @@ class BookmarkIterator(IteratorBase):
         first_iteration = True
         while True:
             if total > 0:
-                page_size = BOOKMARKS_LIMIT if n is None else min(n - total, BOOKMARKS_LIMIT)
+                page_size = BOOKMARKS_LIMIT if self.num_posts is None else min(self.num_posts - total, BOOKMARKS_LIMIT)
                 
             else:
                 # request full pages until it finds the first new id
@@ -168,7 +177,7 @@ class BookmarkIterator(IteratorBase):
             # this is the offset for the next request, not stored in the state
             offset += len(bookmarks)
             
-            if first_iteration and (self.state.head_id is None or direction == FetchDirection.newer):
+            if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
                 self.first_id = bookmarks[0].bookmarkData.id
             
             for bookmark in bookmarks:
@@ -195,24 +204,18 @@ class BookmarkIterator(IteratorBase):
                 remote_post = self.plugin._to_remote_post(post.body, preview=self.subscription is None)
                 yield remote_post
                 
-                if direction == FetchDirection.older:
+                if self.direction == FetchDirection.older:
                     self.state.tail_id = bookmark.bookmarkData.id
                     self.state.offset += 1
                 
                 total +=1
-                if n is not None and total >= n:
+                if self.num_posts is not None and total >= self.num_posts:
                     return
             
             first_iteration = False
     
-    def fetch(self, direction=FetchDirection.newer, n=None):
-        if direction == FetchDirection.newer:
-            if self.state.tail_id is None:
-                direction = FetchDirection.older
-            else:
-                n = None
-        
-        for post in self._iterator(direction, n):
+    def _generator(self):
+        for post in self._iterator():
             yield post
             
             if self.subscription is not None:

@@ -88,6 +88,15 @@ class TweetIterator(IteratorBase):
                 self.subscription.options = self.options.to_json()
                 self.session.add(self.subscription)
     
+    def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
+        if direction == FetchDirection.newer:
+            if self.state.tail_id is None:
+                direction = FetchDirection.older
+            else:
+                num_posts = None
+        
+        super().reconfigure(direction=direction, num_posts=num_posts)
+    
     def _page_iterator(self, method, limit=None, max_id=None, **kwargs):
         total = 0
         while True:
@@ -105,8 +114,9 @@ class TweetIterator(IteratorBase):
                 if limit is not None and total >= limit:
                     return
     
-    def _feed_iterator(self, direction=FetchDirection.newer, limit=None):
-        head = (direction == FetchDirection.newer)
+    def _feed_iterator(self):
+        head = (self.direction == FetchDirection.newer)
+        limit = self.num_posts
         
         page_size = PAGE_LIMIT if limit is None else min(limit, PAGE_LIMIT)
         since_id = self.state.head_id if head else None
@@ -157,19 +167,11 @@ class TweetIterator(IteratorBase):
             len(tweet.urls) > 0
         ))
     
-    def fetch(self, direction=FetchDirection.newer, n=None):
-        limit = n
-        if direction == FetchDirection.newer:
-            if self.state.tail_id is None:
-                direction = FetchDirection.older
-            else:
-                limit = None
-        
-        tweets = self._feed_iterator(direction, limit=limit)
-        
+    def _generator(self):
         first_iteration = True
-        for tweet in tweets:
-            if first_iteration and (self.state.head_id is None or direction == FetchDirection.newer):
+        
+        for tweet in self._feed_iterator():
+            if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
                 self.first_id = tweet.id_str
             
             if self._tweet_has_content(tweet):
@@ -181,7 +183,7 @@ class TweetIterator(IteratorBase):
                 
                 self.session.commit()
             
-            if direction == FetchDirection.older:
+            if self.direction == FetchDirection.older:
                 self.state.tail_id = tweet.id_str
             
             first_iteration = False

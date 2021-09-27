@@ -72,8 +72,17 @@ class CreatorIterator(IteratorBase):
             self.subscription.options = self.options.to_json()
             self.session.add(self.subscription)
     
-    def _post_iterator(self, direction=FetchDirection.newer, n=None):
-        head = (direction == FetchDirection.newer)
+    def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
+        if direction == FetchDirection.newer:
+            if self.state.tail_id is None:
+                direction = FetchDirection.older
+            else:
+                num_posts = None
+        
+        super().reconfigure(direction=direction, num_posts=num_posts)
+    
+    def _post_iterator(self):
+        head = (self.direction == FetchDirection.newer)
         
         min_id = int(self.state.head_id) if head and self.state.head_id is not None else None
         max_id = self.state.tail_id if not head else None
@@ -82,7 +91,7 @@ class CreatorIterator(IteratorBase):
         total = 0
         first_iteration = True
         while True:
-            page_size = PAGE_LIMIT if n is None else min(n - total, PAGE_LIMIT)
+            page_size = PAGE_LIMIT if self.num_posts is None else min(self.num_posts - total, PAGE_LIMIT)
             
             params = {
                 'creatorId': self.options.creator,
@@ -104,7 +113,7 @@ class CreatorIterator(IteratorBase):
             if len(posts) == 0:
                 return
             
-            if first_iteration and (self.state.head_id is None or direction == FetchDirection.newer):
+            if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
                 self.first_id = posts[0].id
             
             for post in posts:
@@ -119,12 +128,12 @@ class CreatorIterator(IteratorBase):
                 max_id = id - 1
                 max_datetime = post.publishedDatetime
                 
-                if direction == FetchDirection.older:
+                if self.direction == FetchDirection.older:
                     self.state.tail_id = post.id
                     self.state.tail_datetime = post.publishedDatetime
                 
                 total += 1
-                if n is not None and total >= n:
+                if self.num_posts is not None and total >= self.num_posts:
                     return
             
             if body.nextUrl is None:
@@ -132,14 +141,8 @@ class CreatorIterator(IteratorBase):
             
             first_iteration = False
     
-    def fetch(self, direction=FetchDirection.newer, n=None):
-        if direction == FetchDirection.newer:
-            if self.state.tail_id is None:
-                direction = FetchDirection.older
-            else:
-                n = None
-        
-        for post in self._post_iterator(direction, n):
+    def _generator(self):
+        for post in self._post_iterator():
             remote_post = self.plugin._to_remote_post(post, preview=self.subscription is None)
             yield remote_post
             
