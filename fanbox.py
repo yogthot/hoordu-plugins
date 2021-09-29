@@ -161,7 +161,7 @@ class CreatorIterator(IteratorBase):
         
         self.session.commit()
 
-class Fanbox(PluginBase):
+class Fanbox(SimplePluginBase):
     name = 'fanbox'
     version = 1
     iterator = CreatorIterator

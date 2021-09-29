@@ -90,7 +90,7 @@ class Drive:
         return f'{self.ENDPOINT}/files/{file.id}?alt=media'
 
 
-class GDrive(PluginBase):
+class GDrive(SimplePluginBase):
     name = 'gdrive'
     version = 1
     

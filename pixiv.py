@@ -233,7 +233,7 @@ class BookmarkIterator(IteratorBase):
         
         self.session.commit()
 
-class Pixiv(PluginBase):
+class Pixiv(SimplePluginBase):
     name = 'pixiv'
     version = 1
     

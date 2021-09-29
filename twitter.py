@@ -198,7 +198,7 @@ class TweetIterator(IteratorBase):
         
         self.session.commit()
 
-class Twitter(PluginBase):
+class Twitter(SimplePluginBase):
     name = 'twitter'
     version = 3
     iterator = TweetIterator

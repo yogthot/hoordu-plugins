@@ -110,7 +110,7 @@ class CreatorIterator(IteratorBase):
         
         self.session.commit()
 
-class Fantia(PluginBase):
+class Fantia(SimplePluginBase):
     name = 'fantia'
     version = 1
     iterator = CreatorIterator
