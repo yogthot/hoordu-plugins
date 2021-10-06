@@ -157,8 +157,6 @@ class GDrive(SimplePluginBase):
                 return True, None
             
         else:
-            # TODO check if everything is working
-            
             # the config contains every required property
             return True, None
     
@@ -199,27 +197,35 @@ class GDrive(SimplePluginBase):
         self.api = Drive(self.config.access_token, self._refresh_token)
     
     def _refresh_token(self):
+        session = self.session.priority
+        source = self.get_source(session)
+        config = hoordu.Dynamic.from_json(source.config)
+        
         try:
-            tokens = self.oauth.refresh_access_token(self.config.refresh_token)
+            tokens = self.oauth.refresh_access_token(config.refresh_token)
+            
         except OAuthError as e:
             msg = hoordu.Dynamic.from_json(str(e))
             if msg.error == 'invalid_grant':
                 self.session.rollback()
                 
                 # refresh token expired or revoked
-                self.config.pop('access_token')
-                self.config.pop('refresh_token')
-                self.source.config = self.config.to_json()
-                self.session.add(self.source)
+                config.pop('access_token')
+                config.pop('refresh_token')
+                source.config = config.to_json()
+                session.add(source)
+                session.commit()
             
             raise
         
         access_token = tokens['access_token']
+        self.config.access_token = access_token
         
         # update access_token in the database
-        self.config.access_token = access_token
-        self.source.config = self.config.to_json()
-        self.session.add(self.source)
+        config.access_token = access_token
+        source.config = config.to_json()
+        session.add(source)
+        session.commit()
         
         return access_token
     
