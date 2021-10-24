@@ -355,15 +355,13 @@ class Fanbox(SimplePluginBase):
                     self.session.add(file)
                 
                 need_orig = not file.present and not preview
-                need_thumb = not file.thumb_present and post.coverImageUrl is not None
                 
-                if need_thumb or need_orig:
-                    self.log.info('downloading files for post: %s, file: %r, thumb: %r', remote_post.id, need_orig, need_thumb)
+                if need_orig:
+                    self.log.info('downloading files for post: %s', remote_post.id)
                     
-                    orig = self._download_file(rfile.url) if need_orig else None
-                    thumb = self._download_file(post.coverImageUrl) if need_thumb else None
+                    orig = self._download_file(rfile.url)
                     
-                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                    self.session.import_file(file, orig=orig, move=True)
             
             remote_post.comment = post.body.text
             self.session.add(remote_post)

@@ -254,19 +254,14 @@ class Fantia(SimplePluginBase):
                 file = remote_post.files[0]
             
             need_orig = not file.present and not preview
-            need_thumb = not file.thumb_present
-            if need_orig or need_thumb:
-                self.log.info('downloading: %s, file: %r, thumb: %r', content.filename, need_orig, need_thumb)
+            
+            if need_orig:
+                self.log.info('downloading: %s', content.filename)
+                
                 orig_url = FILE_DOWNLOAD_URL.format(download_uri=content.download_uri)
-                orig = self._download_file(orig_url, filename=content.filename) if need_orig else None
+                orig = self._download_file(orig_url, filename=content.filename)
                 
-                if post.thumb is not None:
-                    thumb = self._download_file(post.thumb.medium) if need_thumb else None
-                    
-                else:
-                    thumb = None
-                
-                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                self.session.import_file(file, orig=orig, move=True)
             
         elif content.category == 'photo_gallery':
             current_files = {file.metadata_: file for file in remote_post.files}
