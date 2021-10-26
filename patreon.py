@@ -92,6 +92,7 @@ class CreatorIterator(IteratorBase):
         if cursor is not None:
             params['page[cursor]'] = cursor
         
+        self.log.info('getting next page')
         response = self.http.get(POST_LIST_URL, params=params)
         response.raise_for_status()
         return hoordu.Dynamic.from_json(response.text)
@@ -260,66 +261,63 @@ class Patreon(SimplePluginBase):
         
         post_time = dateutil.parser.parse(post.published_at).astimezone(timezone.utc)
         
-        self.log.info('getting post %s', post_id)
+        if remote_post is None:
+            remote_post = self._get_post(post_id)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost) \
-                    .filter(
-                        RemotePost.source_id == self.source.id,
-                        RemotePost.original_id == post_id
-                    ).one_or_none()
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=post_id,
+                url=POST_FORMAT.format(post_id=post_id),
+                title=post.title,
+                type=PostType.collection,
+                post_time=post_time
+            )
             
-            if remote_post is None:
-                self.log.info('creating new post')
-                
-                # parse post content
-                content = re.sub('\s+', ' ', post.content)
-                comment_html = BeautifulSoup(content, 'html.parser')
-                
-                urls = []
-                page_url = POST_FORMAT.format(post_id=post_id)
-                for a in comment_html.select('a'):
-                    url = self._parse_href(page_url, a['href'])
-                    urls.append(url)
-                    
-                    a.replace_with(url)
-                
-                for br in comment_html.find_all('br'):
-                    br.replace_with('\n')
-                
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=post_id,
-                    url=POST_FORMAT.format(post_id=post_id),
-                    title=post.title,
-                    comment=comment_html.text,
-                    type=PostType.collection,
-                    post_time=post_time
-                )
-                
-                if post.current_user_has_liked is True:
-                    remote_post.favorite = True
-                
-                creator_tag = self._get_tag(TagCategory.artist, user_id)
-                remote_post.tags.append(creator_tag)
-                
-                if creator_tag.update_metadata('vanity', user_vanity):
-                    self.session.add(creator_tag)
-                
-                tags = post_obj.relationships.user_defined_tags.data or []
-                for tag in tags:
-                    name = tag.id.split(';', 1)[1]
-                    remote_tag = self._get_tag(TagCategory.general, name)
-                    remote_post.tags.append(remote_tag)
-                
-                for url in urls:
-                    remote_post.related.append(Related(url=url))
-                
-                embed = post.get('embed')
-                if embed is not None:
-                    remote_post.related.append(Related(url=embed.url))
-                
-                self.session.add(remote_post)
+            self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        # parse post content
+        content = re.sub('\s+', ' ', post.content)
+        comment_html = BeautifulSoup(content, 'html.parser')
+        
+        urls = []
+        page_url = POST_FORMAT.format(post_id=post_id)
+        for a in comment_html.select('a'):
+            url = self._parse_href(page_url, a['href'])
+            urls.append(url)
+            
+            a.replace_with(url)
+        
+        for br in comment_html.find_all('br'):
+            br.replace_with('\n')
+        
+        remote_post.comment = comment_html.text
+        
+        if post.current_user_has_liked is True:
+            remote_post.favorite = True
+        
+        creator_tag = self._get_tag(TagCategory.artist, user_id)
+        remote_post.add_tag(creator_tag)
+        
+        if creator_tag.update_metadata('vanity', user_vanity):
+            self.session.add(creator_tag)
+        
+        tags = post_obj.relationships.user_defined_tags.data or []
+        for tag in tags:
+            name = tag.id.split(';', 1)[1]
+            remote_tag = self._get_tag(TagCategory.general, name)
+            remote_post.add_tag(remote_tag)
+        
+        for url in urls:
+            remote_post.add_related_url(url)
+        
+        embed = post.get('embed')
+        if embed is not None:
+            remote_post.add_related_url(embed.url)
         
         current_files = {file.metadata_: file for file in remote_post.files}
         
@@ -359,7 +357,6 @@ class Patreon(SimplePluginBase):
                 file = File(remote=remote_post, remote_order=order, metadata_=id)
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                 
             else:
                 file.remote_order = order
@@ -369,7 +366,7 @@ class Patreon(SimplePluginBase):
             need_thumb = not file.thumb_present and thumb_url is not None
             
             if need_thumb or need_orig:
-                self.log.info('downloading files for post: %s, file: %r, thumb: %r', remote_post.id, need_orig, need_thumb)
+                self.log.info(f'downloading file: {file.remote_order}')
                 
                 orig = self._download_file(orig_url, filename=orig_filename) if need_orig else None
                 thumb = self._download_file(thumb_url) if need_thumb else None
@@ -384,7 +381,6 @@ class Patreon(SimplePluginBase):
         
         if remote_post is not None:
             id = remote_post.original_id
-            self.log.info('update request for %s', id)
         
         params = {
             'include': 'attachments,audio,images,media,user,user_defined_tags',

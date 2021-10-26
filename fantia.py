@@ -77,7 +77,6 @@ class CreatorIterator(IteratorBase):
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
             response.raise_for_status()
             post = hoordu.Dynamic.from_json(response.text).post
-            self.log.debug('post: %s', post)
             
             yield post
             
@@ -201,62 +200,63 @@ class Fantia(SimplePluginBase):
         # possible timezone issues?
         post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc)
         
-        self.log.info('getting post %s', content_id)
+        if remote_post is None:
+            remote_post = self._get_post(content_id)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == content_id).one_or_none()
+            metadata = hoordu.Dynamic()
+            if content.plan is not None:
+                metadata.price = content.plan.price
             
-            if remote_post is None:
-                self.log.info('creating new post')
-                
-                metadata = hoordu.Dynamic()
-                if content.plan is not None:
-                    metadata.price = content.plan.price
-                
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=content_id,
-                    url=POST_FORMAT.format(post_id=post.id),
-                    title=content.title,
-                    comment=content.comment,
-                    type=PostType.collection,
-                    post_time=post_time,
-                    metadata_=metadata.to_json()
-                )
-                
-                if post.liked is True:
-                    remote_post.favorite = True
-                
-                # creators are identified by their id because their name can change
-                creator_tag = self._get_tag(TagCategory.artist, creator_id)
-                remote_post.tags.append(creator_tag)
-                
-                if creator_tag.update_metadata('name', creator_name):
-                    self.session.add(creator_tag)
-                
-                for tag in post.tags:
-                    remote_tag = self._get_tag(TagCategory.general, tag.name)
-                    remote_post.tags.append(remote_tag)
-                
-                if post.rating == 'adult':
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-                
-                self.session.add(remote_post)
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=content_id,
+                url=POST_FORMAT.format(post_id=post.id),
+                title=content.title,
+                comment=content.comment,
+                type=PostType.collection,
+                post_time=post_time,
+                metadata_=metadata.to_json()
+            )
+            
+            self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        if post.liked is True:
+            remote_post.favorite = True
+        
+        # creators are identified by their id because their name can change
+        creator_tag = self._get_tag(TagCategory.artist, creator_id)
+        remote_post.add_tag(creator_tag)
+        
+        if creator_tag.update_metadata('name', creator_name):
+            self.session.add(creator_tag)
+        
+        for tag in post.tags:
+            remote_tag = self._get_tag(TagCategory.general, tag.name)
+            remote_post.add_tag(remote_tag)
+        
+        if post.rating == 'adult':
+            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
+            remote_post.add_tag(nsfw_tag)
         
         if content.category == 'file':
             if len(remote_post.files) == 0:
                 file = File(remote=remote_post, remote_order=0, filename=content.filename)
+                
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, filename: %s', remote_post.id, content.filename)
+                
             else:
                 file = remote_post.files[0]
             
             need_orig = not file.present and not preview
             
             if need_orig:
-                self.log.info('downloading: %s', content.filename)
+                self.log.info(f'downloading file: {content.filename}')
                 
                 orig_url = FILE_DOWNLOAD_URL.format(download_uri=content.download_uri)
                 orig = self._download_file(orig_url, filename=content.filename)
@@ -275,7 +275,6 @@ class Fantia(SimplePluginBase):
                     file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                     self.session.add(file)
                     self.session.flush()
-                    self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 elif file.remote_order != order:
                     file.remote_order = order
@@ -285,7 +284,7 @@ class Fantia(SimplePluginBase):
                 need_thumb = not file.thumb_present
                 
                 if need_thumb or need_orig:
-                    self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     orig = self._download_file(photo.url.original) if need_orig else None
                     thumb = self._download_file(photo.url.medium) if need_thumb else None
@@ -323,7 +322,6 @@ class Fantia(SimplePluginBase):
                             file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                             self.session.add(file)
                             self.session.flush()
-                            self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                         
                         orig_url = FILE_DOWNLOAD_URL.format(download_uri=fantiaImage.original_url)
                         thumb_url = fantiaImage.url
@@ -332,7 +330,7 @@ class Fantia(SimplePluginBase):
                         need_thumb = not file.thumb_present
                         
                         if need_thumb or need_orig:
-                            self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                            self.log.info(f'downloading file: {file.remote_order}')
                             
                             orig = self._download_file(orig_url) if need_orig else None
                             thumb = self._download_file(thumb_url) if need_thumb else None
@@ -347,7 +345,7 @@ class Fantia(SimplePluginBase):
                         order += 1
                         
                     else:
-                        self.log.warning('unknown blog insert: %s', str(insert))
+                        self.log.warning(f'unknown blog insert: {str(insert)}')
             
             remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
             remote_post.type = PostType.blog
@@ -365,8 +363,6 @@ class Fantia(SimplePluginBase):
         # possible timezone issues?
         post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc)
         
-        self.log.info('getting post %s', main_id)
-        
         if remote_post is not None:
             id_parts = remote_post.id.split('-')
             if len(id_parts) == 2:
@@ -380,40 +376,42 @@ class Fantia(SimplePluginBase):
                     return [remote_post]
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == main_id).one_or_none()
+            remote_post = self._get_post(main_id)
+        
+        if remote_post is None:
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=main_id,
+                url=POST_FORMAT.format(post_id=main_id),
+                title=post.title,
+                comment=post.comment,
+                type=PostType.collection,
+                post_time=post_time
+            )
             
-            if remote_post is None:
-                self.log.info('creating new post')
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=main_id,
-                    url=POST_FORMAT.format(post_id=main_id),
-                    title=post.title,
-                    comment=post.comment,
-                    type=PostType.collection,
-                    post_time=post_time
-                )
-                
-                if post.liked is True:
-                    remote_post.favorite = True
-                
-                # creators are identified by their id because their name can change
-                creator_tag = self._get_tag(TagCategory.artist, creator_id)
-                remote_post.tags.append(creator_tag)
-                
-                if creator_tag.update_metadata('name', creator_name):
-                    self.session.add(creator_tag)
-                
-                for tag in post.tags:
-                    remote_tag = self._get_tag(TagCategory.general, tag.name)
-                    remote_post.tags.append(remote_tag)
-                
-                if post.rating == 'adult':
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-                
-                
-                self.session.add(remote_post)
+            self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        if post.liked is True:
+            remote_post.favorite = True
+        
+        # creators are identified by their id because their name can change
+        creator_tag = self._get_tag(TagCategory.artist, creator_id)
+        remote_post.add_tag(creator_tag)
+        
+        if creator_tag.update_metadata('name', creator_name):
+            self.session.add(creator_tag)
+        
+        for tag in post.tags:
+            remote_tag = self._get_tag(TagCategory.general, tag.name)
+            remote_post.add_tag(remote_tag)
+        
+        if post.rating == 'adult':
+            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
+            remote_post.add_tag(nsfw_tag)
         
         # download thumbnail if there is one
         if len(remote_post.files) == 0:
@@ -430,9 +428,11 @@ class Fantia(SimplePluginBase):
             need_orig = not file.present and not preview
             need_thumb = not file.thumb_present
             if need_orig or need_thumb:
-                self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                self.log.info(f'downloading file: {file.remote_order}')
+                
                 orig = self._download_file(post.thumb.original) if need_orig else None
                 thumb = self._download_file(post.thumb.medium) if need_thumb else None
+                
                 self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         # convert the post contents to posts as well
@@ -442,7 +442,12 @@ class Fantia(SimplePluginBase):
                 content_post = self._content_to_post(post, content, preview=preview)
                 remote_posts.append(content_post)
                 self.session.flush()
-                rel = self.session.query(Related).filter(Related.related_to_id == remote_post.id, Related.remote_id == content_post.id).one_or_none()
+                rel = self.session.query(Related) \
+                        .filter(
+                            Related.related_to_id == remote_post.id,
+                            Related.remote_id == content_post.id
+                        ).one_or_none()
+                
                 if rel is None:
                     remote_post.related.append(Related(remote=content_post))
         
@@ -454,12 +459,10 @@ class Fantia(SimplePluginBase):
         
         if remote_post is not None:
             id = remote_post.original_id.split('-')[0]
-            self.log.info('update request for %s', id)
         
         response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()
         post = hoordu.Dynamic.from_json(response.text).post
-        self.log.debug('post json: %s', post)
         
         remote_posts = self._to_remote_posts(post, remote_post=remote_post, preview=preview)
         if remote_posts is not None and len(remote_posts) > 0:

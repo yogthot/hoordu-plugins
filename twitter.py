@@ -100,9 +100,9 @@ class TweetIterator(IteratorBase):
     def _page_iterator(self, method, limit=None, max_id=None, **kwargs):
         total = 0
         while True:
+            self.log.info('getting next page')
             tweets = method(max_id=max_id, **kwargs)
-            self.log.debug('method: %s, max_id: %s, kwargs: %s', method.__name__, max_id, kwargs)
-            self.log.debug('page: %s', tweets)
+            self.log.debug(f'method: {method.__name__} max_id: {max_id}, kwargs: {kwargs}')
             if len(tweets) == 0:
                 return
             
@@ -315,8 +315,8 @@ class Twitter(SimplePluginBase):
         self.api = twitter.Api(
             consumer_key=self.config.consumer_key,
             consumer_secret=self.config.consumer_secret,
-            access_token_key=self.config.get('access_token_key', None),
-            access_token_secret=self.config.get('access_token_secret', None),
+            access_token_key=self.config.access_token_key,
+            access_token_secret=self.config.access_token_secret,
             tweet_mode='extended'
         )
     
@@ -390,101 +390,61 @@ class Twitter(SimplePluginBase):
         user_id = tweet.user.id_str
         text = tweet.full_text
         post_time = datetime.utcfromtimestamp(tweet.created_at_in_seconds)
-        update = False
-        
-        self.log.info('getting tweet %s', original_id)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
-            if remote_post is None:
-                self.log.info('creating new post')
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=original_id,
-                    url=TWEET_FORMAT.format(user=user, tweet_id=original_id),
-                    comment=text,
-                    type=PostType.set,
-                    post_time=post_time,
-                    metadata_=hoordu.Dynamic({'user': user}).to_json()
-                )
-                
-                user_tag = self._get_tag(TagCategory.artist, user_id)
-                remote_post.tags.append(user_tag)
-                
-                if user_tag.update_metadata('user', user):
-                    self.session.add(user_tag)
-                
-                remote_post.favorite = tweet.favorited is True
-                
-                if tweet.possibly_sensitive:
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-                
-                if tweet.hashtags is not None:
-                    for hashtag in tweet.hashtags:
-                        tag = hashtag.text
-                        nsfw_tag = self._get_tag(TagCategory.general, tag)
-                        remote_post.tags.append(nsfw_tag)
-                
-                if tweet.in_reply_to_status_id is not None:
-                    url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
-                    remote_post.related.append(Related(url=url))
-                
-                if tweet.urls is not None:
-                    for url in tweet.urls:
-                        if SUPPORT_URL_REGEXP.match(url.url):
-                            raise APIError(text)
-                        
-                        self.log.info('found url %s', url.url)
-                        # the unwound section is a premium feature
-                        final_url = self._unwind_url(url.url)
-                        remote_post.related.append(Related(url=final_url))
-                
-                self.session.add(remote_post)
-                
-            else:
-                self.log.info('post already exists: %s', remote_post.id)
-                update = True
-            
-        else:
-            update = True
+            remote_post = self._get_post(original_id)
         
-        if update:
-            remote_post.comment = text
-            remote_post.favorite = tweet.favorited is True
-            
-            existing_tags = [(t.category, t.tag) for t in remote_post.tags]
-            existing_urls = [r.url for r in remote_post.related]
-            
-            if tweet.possibly_sensitive:
-                if (TagCategory.meta, 'nsfw') not in existing_tags:
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-            
-            if tweet.hashtags is not None:
-                for hashtag in tweet.hashtags:
-                    tag = hashtag.text
-                    if (TagCategory.general, tag) not in existing_tags:
-                        nsfw_tag = self._get_tag(TagCategory.general, tag)
-                        remote_post.tags.append(nsfw_tag)
-            
-            if tweet.in_reply_to_status_id is not None:
-                url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
-                if url not in existing_urls:
-                    remote_post.related.append(Related(url=url))
-            
-            if tweet.urls is not None:
-                for url in tweet.urls:
-                    if SUPPORT_URL_REGEXP.match(url.url):
-                        raise APIError(text)
-                    
-                    self.log.info('found url %s', url.url)
-                    # the unwound section is a premium feature
-                    final_url = self._unwind_url(url.url)
-                    if final_url not in existing_urls:
-                        remote_post.related.append(Related(url=final_url))
+        if remote_post is None:
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=original_id,
+                url=TWEET_FORMAT.format(user=user, tweet_id=original_id),
+                comment=text,
+                type=PostType.set,
+                post_time=post_time,
+                metadata_=hoordu.Dynamic({'user': user}).to_json()
+            )
             
             self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        remote_post.comment = text
+        remote_post.favorite = tweet.favorited is True
+        
+        user_tag = self._get_tag(TagCategory.artist, user_id)
+        remote_post.add_tag(user_tag)
+        
+        if user_tag.update_metadata('user', user):
+            self.session.add(user_tag)
+        
+        if tweet.possibly_sensitive:
+            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
+            remote_post.add_tag(nsfw_tag)
+        
+        if tweet.hashtags is not None:
+            for hashtag in tweet.hashtags:
+                tag = hashtag.text
+                nsfw_tag = self._get_tag(TagCategory.general, tag)
+                remote_post.add_tag(nsfw_tag)
+        
+        if tweet.in_reply_to_status_id is not None:
+            url = TWEET_FORMAT.format(user=tweet.in_reply_to_screen_name, tweet_id=tweet.in_reply_to_status_id)
+            remote_post.add_related_url(url)
+        
+        if tweet.urls is not None:
+            for url in tweet.urls:
+                if SUPPORT_URL_REGEXP.match(url.url):
+                    raise APIError(text)
+                
+                # the unwound section is a premium feature
+                self.log.info(f'unwinding: {url.url}')
+                final_url = self._unwind_url(url.url)
+                remote_post.add_related_url(final_url)
+        
+        self.session.add(remote_post)
         
         if tweet.media is not None:
             available = set(range(len(tweet.media)))
@@ -494,14 +454,13 @@ class Twitter(SimplePluginBase):
                 file = File(remote=remote_post, remote_order=order)
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
             
             for file in remote_post.files:
                 need_thumb = not file.thumb_present
                 need_file = not file.present and not preview
                 
                 if need_thumb or need_file:
-                    self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     media = tweet.media[file.remote_order]
                     thumb = None
@@ -541,10 +500,8 @@ class Twitter(SimplePluginBase):
         
         if remote_post is not None:
             id = remote_post.original_id
-            self.log.info('update request for %s', id)
         
         tweet = self.api.GetStatus(id)
-        self.log.debug('tweet: %s', tweet)
         
         return self.tweet_to_remote_post(tweet, remote_post=remote_post, preview=preview)
     

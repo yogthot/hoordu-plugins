@@ -262,54 +262,53 @@ class Fanbox(SimplePluginBase):
         # possible timezone issues?
         post_time = dateutil.parser.parse(post.publishedDatetime).astimezone(timezone.utc)
         
-        self.log.info('getting post %s', main_id)
+        if remote_post is None:
+            remote_post = self._get_post(main_id)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == main_id).one_or_none()
+            metadata = hoordu.Dynamic()
+            if post.feeRequired != 0:
+                metadata.price = post.feeRequired
             
-            if remote_post is None:
-                self.log.info('creating new post')
-                
-                metadata = hoordu.Dynamic()
-                if post.feeRequired != 0:
-                    metadata.price = post.feeRequired
-                
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=main_id,
-                    url=POST_FORMAT.format(post_id=main_id),
-                    title=post.title,
-                    type=PostType.collection,
-                    post_time=post_time,
-                    metadata_=metadata.to_json()
-                )
-                
-                if post.isLiked is True:
-                    remote_post.favorite = True
-                
-                # creators are identified by their pixiv id because their name and creatorId can change
-                creator_tag = self._get_tag(TagCategory.artist, creator_id)
-                remote_post.tags.append(creator_tag)
-                
-                if any((creator_tag.update_metadata('name', creator_name),
-                        creator_tag.update_metadata('slug', creator_slug))):
-                    self.session.add(creator_tag)
-                
-                for tag in post.tags:
-                    remote_tag = self._get_tag(TagCategory.general, tag)
-                    remote_post.tags.append(remote_tag)
-                
-                if post.hasAdultContent is True:
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-                
-                self.session.add(remote_post)
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=main_id,
+                url=POST_FORMAT.format(post_id=main_id),
+                title=post.title,
+                type=PostType.collection,
+                post_time=post_time,
+                metadata_=metadata.to_json()
+            )
+            
+            self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        if post.isLiked is True:
+            remote_post.favorite = True
+        
+        # creators are identified by their pixiv id because their name and creatorId can change
+        creator_tag = self._get_tag(TagCategory.artist, creator_id)
+        remote_post.add_tag(creator_tag)
+        
+        if any((creator_tag.update_metadata('name', creator_name),
+                creator_tag.update_metadata('slug', creator_slug))):
+            self.session.add(creator_tag)
+        
+        for tag in post.tags:
+            remote_tag = self._get_tag(TagCategory.general, tag)
+            remote_post.add_tag(remote_tag)
+        
+        if post.hasAdultContent is True:
+            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
+            remote_post.add_tag(nsfw_tag)
         
         current_files = {file.metadata_: file for file in remote_post.files}
         current_urls = [r.url for r in remote_post.related]
         
         if post.type == 'image':
-            
             for image, order in zip(post.body.images, itertools.count(1)):
                 id = 'i-{}'.format(image.id)
                 file = current_files.get(id)
@@ -318,7 +317,6 @@ class Fanbox(SimplePluginBase):
                     file = File(remote=remote_post, remote_order=order, metadata_=id)
                     self.session.add(file)
                     self.session.flush()
-                    self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.remote_order = order
@@ -328,7 +326,7 @@ class Fanbox(SimplePluginBase):
                 need_thumb = not file.thumb_present
                 
                 if need_thumb or need_orig:
-                    self.log.info('downloading files for post: %s, file: %r, thumb: %r', remote_post.id, need_orig, need_thumb)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     orig = self._download_file(image.originalUrl) if need_orig else None
                     thumb = self._download_file(image.thumbnailUrl) if need_thumb else None
@@ -348,7 +346,6 @@ class Fanbox(SimplePluginBase):
                     file = File(remote=remote_post, remote_order=order, filename=filename, metadata_=id)
                     self.session.add(file)
                     self.session.flush()
-                    self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.remote_order = order
@@ -357,7 +354,7 @@ class Fanbox(SimplePluginBase):
                 need_orig = not file.present and not preview
                 
                 if need_orig:
-                    self.log.info('downloading files for post: %s', remote_post.id)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     orig = self._download_file(rfile.url)
                     
@@ -381,7 +378,7 @@ class Fanbox(SimplePluginBase):
                         for link in links:
                             url = link.url
                             if url not in current_urls:
-                                remote_post.related.append(Related(url=url))
+                                remote_post.add_related_url(url)
                     
                     blog.append({
                         'type': 'text',
@@ -396,7 +393,6 @@ class Fanbox(SimplePluginBase):
                         file = File(remote=remote_post, remote_order=order, metadata_=id)
                         self.session.add(file)
                         self.session.flush()
-                        self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                         
                     else:
                         file.remote_order = order
@@ -409,7 +405,7 @@ class Fanbox(SimplePluginBase):
                     need_thumb = not file.thumb_present
                     
                     if need_thumb or need_orig:
-                        self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                        self.log.info(f'downloading file: {file.remote_order}')
                         
                         orig = self._download_file(orig_url) if need_orig else None
                         thumb = self._download_file(thumb_url) if need_thumb else None
@@ -431,7 +427,6 @@ class Fanbox(SimplePluginBase):
                         file = File(remote=remote_post, remote_order=order, metadata_=id)
                         self.session.add(file)
                         self.session.flush()
-                        self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                     orig_url = filemap[block.fileId].url
                     thumb_url = post.coverImageUrl
@@ -440,7 +435,7 @@ class Fanbox(SimplePluginBase):
                     need_thumb = not file.thumb_present and thumb_url is not None
                     
                     if need_thumb or need_orig:
-                        self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                        self.log.info(f'downloading file: {file.remote_order}')
                         
                         orig = self._download_file(orig_url) if need_orig else None
                         thumb = self._download_file(thumb_url) if need_thumb else None
@@ -471,7 +466,7 @@ class Fanbox(SimplePluginBase):
                         raise NotImplementedError('unknown embed service provider: {}'.format(embed.serviceProvider))
                     
                     if url not in current_urls:
-                        remote_post.related.append(Related(url=url))
+                        remote_post.add_related_url(url)
                     
                     blog.append({
                         'type': 'text',
@@ -501,7 +496,6 @@ class Fanbox(SimplePluginBase):
         
         if remote_post is not None:
             id = remote_post.original_id
-            self.log.info('update request for %s', id)
         
         response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()

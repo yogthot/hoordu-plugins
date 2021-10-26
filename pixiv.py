@@ -56,7 +56,6 @@ class IllustIterator(IteratorBase):
         response.raise_for_status()
         user_info = hoordu.Dynamic.from_json(response.text)
         if user_info.error is True:
-            self.log.error('pixiv api error: %s', user_info.message)
             raise APIError(user_info.message)
         
         body = user_info.body
@@ -84,10 +83,8 @@ class IllustIterator(IteratorBase):
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
             response.raise_for_status()
             post = hoordu.Dynamic.from_json(response.text)
-            self.log.debug('post json: %s', post)
             
             if post.error is True:
-                self.log.error('pixiv api error: %s', post.message)
                 raise APIError(post.message)
             
             if self.state.head_id is None:
@@ -166,7 +163,6 @@ class BookmarkIterator(IteratorBase):
             response.raise_for_status()
             bookmarks_resp = hoordu.Dynamic.from_json(response.text)
             if bookmarks_resp.error is True:
-                self.log.error('pixiv api error: %s', user_info.message)
                 raise APIError(bookmarks_resp.message)
             
             bookmarks = bookmarks_resp.body.works
@@ -195,10 +191,8 @@ class BookmarkIterator(IteratorBase):
                 response = self.http.get(POST_GET_URL.format(post_id=post_id))
                 response.raise_for_status()
                 post = hoordu.Dynamic.from_json(response.text)
-                self.log.debug('post json: %s', post)
                 
                 if post.error is True:
-                    self.log.error('pixiv api error: %s', post.message)
                     raise APIError(post.message)
                 
                 remote_post = self.plugin._to_remote_post(post.body, preview=self.subscription is None)
@@ -355,84 +349,82 @@ class Pixiv(SimplePluginBase):
         else:
             post_type = PostType.set
         
-        self.log.info('getting post %s', post_id)
+        if remote_post is None:
+            remote_post = self._get_post(post_id)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == post_id).one_or_none()
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=post_id,
+                url=POST_FORMAT.format(post_id=post_id),
+                title=post.title,
+                type=post_type,
+                post_time=post_time
+            )
             
-            if remote_post is None:
-                self.log.info('creating new post')
-                
-                # there is no visual difference in multiple whitespace (or newlines for that matter)
-                # unless inside <pre>, but that's too hard to deal with :(
-                description = re.sub('\s+', ' ', post.description)
-                comment_html = BeautifulSoup(description, 'html.parser')
-                
-                urls = []
-                page_url = POST_FORMAT.format(post_id=post_id)
-                for a in comment_html.select('a'):
-                    url = self._parse_href(page_url, a['href'])
-                    match = REDIRECT_REGEXP.match(url)
-                    if match:
-                        url = unquote(match.group('url'))
-                        urls.append(url)
-                        
-                    else:
-                        urls.append(url)
-                    
-                    a.replace_with(url)
-                
-                for br in comment_html.find_all('br'):
-                    br.replace_with('\n')
-                
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=post_id,
-                    url=POST_FORMAT.format(post_id=post_id),
-                    title=post.title,
-                    comment=comment_html.text,
-                    type=post_type,
-                    post_time=post_time
-                )
-                
-                if post.likeData:
-                    remote_post.favorite = True
-                
-                user_tag = self._get_tag(TagCategory.artist, user_id)
-                remote_post.tags.append(user_tag)
-                
-                if any((user_tag.update_metadata('name', user_name),
-                        user_tag.update_metadata('account', user_account))):
-                    self.session.add(user_tag)
-                
-                for tag in post.tags.tags:
-                    remote_tag = self._get_tag(TagCategory.general, tag.tag)
-                    remote_post.tags.append(remote_tag)
-                    if tag.defined('romaji'):
-                        tag_metadata = hoordu.Dynamic.from_json(remote_tag.metadata_)
-                        if tag_metadata.get('romaji', None) != tag.romaji:
-                            tag_metadata.romaji = tag.romaji
-                            remote_tag.metadata_ = tag_metadata.to_json()
-                            self.session.add(remote_tag)
-                    
-                
-                if post.xRestrict >= 1:
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-                    remote_post.tags.append(nsfw_tag)
-                    
-                if post.xRestrict >= 2:
-                    nsfw_tag = self._get_tag(TagCategory.meta, 'extreme')
-                    remote_post.tags.append(nsfw_tag)
-                
-                if post.isOriginal:
-                    original_tag = self._get_tag(TagCategory.copyright, 'original')
-                    remote_post.tags.append(original_tag)
-                
-                for url in urls:
-                    remote_post.related.append(Related(url=url))
-                
-                self.session.add(remote_post)
+            self.session.add(remote_post)
+            self.session.flush()
         
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
+        # there is no visual difference in multiple whitespace (or newlines for that matter)
+        # unless inside <pre>, but that's too hard to deal with :(
+        description = re.sub('\s+', ' ', post.description)
+        comment_html = BeautifulSoup(description, 'html.parser')
+        
+        urls = []
+        page_url = POST_FORMAT.format(post_id=post_id)
+        for a in comment_html.select('a'):
+            url = self._parse_href(page_url, a['href'])
+            match = REDIRECT_REGEXP.match(url)
+            if match:
+                url = unquote(match.group('url'))
+                urls.append(url)
+                
+            else:
+                urls.append(url)
+            
+            a.replace_with(url)
+        
+        for br in comment_html.find_all('br'):
+            br.replace_with('\n')
+        
+        remote_post.comment = comment_html.text
+        
+        if post.likeData:
+            remote_post.favorite = True
+        
+        user_tag = self._get_tag(TagCategory.artist, user_id)
+        remote_post.add_tag(user_tag)
+        
+        if any((user_tag.update_metadata('name', user_name),
+                user_tag.update_metadata('account', user_account))):
+            self.session.add(user_tag)
+        
+        for tag in post.tags.tags:
+            remote_tag = self._get_tag(TagCategory.general, tag.tag)
+            remote_post.add_tag(remote_tag)
+            
+            if tag.defined('romaji') and remote_tag.update_metadata('romaji', tag.romaji):
+                self.session.add(remote_tag)
+        
+        if post.xRestrict >= 1:
+            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
+            remote_post.add_tag(nsfw_tag)
+            
+        if post.xRestrict >= 2:
+            nsfw_tag = self._get_tag(TagCategory.meta, 'extreme')
+            remote_post.add_tag(nsfw_tag)
+        
+        if post.isOriginal:
+            original_tag = self._get_tag(TagCategory.copyright, 'original')
+            remote_post.add_tag(original_tag)
+        
+        for url in urls:
+            remote_post.add_related_url(url)
+        
+        # files
         if post.illustType == 2:
             # ugoira
             if len(remote_post.files) > 0:
@@ -442,13 +434,12 @@ class Pixiv(SimplePluginBase):
                 file = File(remote=remote_post, remote_order=0)
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, 0)
             
             need_orig = not file.present and not preview
             need_thumb = not file.thumb_present
             
             if need_thumb or need_orig:
-                self.log.info('downloading files for post: %s, file: %r, thumb: %r', remote_post.id, need_orig, need_thumb)
+                self.log.info(f'downloading file: {file.remote_order}')
                 
                 orig = None
                 if need_orig:
@@ -474,13 +465,12 @@ class Pixiv(SimplePluginBase):
                 file = File(remote=remote_post, remote_order=0)
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, 0)
             
             need_orig = not file.present and not preview
             need_thumb = not file.thumb_present
             
             if need_thumb or need_orig:
-                self.log.info('downloading files for post: %s, file: %r, thumb: %r', remote_post.id, need_orig, need_thumb)
+                self.log.info(f'downloading file: {file.remote_order}')
                 
                 orig = self._download_file(post.urls.original) if need_orig else None
                 thumb = self._download_file(post.urls.small) if need_thumb else None
@@ -496,7 +486,6 @@ class Pixiv(SimplePluginBase):
                 file = File(remote=remote_post, remote_order=order)
                 self.session.add(file)
                 self.session.flush()
-                self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
             
             response = self.http.get(POST_PAGES_URL.format(post_id=post_id))
             response.raise_for_status()
@@ -507,7 +496,7 @@ class Pixiv(SimplePluginBase):
                 need_thumb = not file.thumb_present
                 
                 if need_thumb or need_orig:
-                    self.log.info('downloading files for post: %s, order: %r', remote_post.id, file.remote_order)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     orig = self._download_file(pages[file.remote_order].urls.original) if need_orig else None
                     thumb = self._download_file(pages[file.remote_order].urls.small) if need_thumb else None
@@ -522,12 +511,10 @@ class Pixiv(SimplePluginBase):
         
         if remote_post is not None:
             id = remote_post.original_id
-            self.log.info('update request for %s', id)
         
         response = self.http.get(POST_GET_URL.format(post_id=id))
         response.raise_for_status()
         post = hoordu.Dynamic.from_json(response.text)
-        self.log.debug('post json: %s', post)
         
         if post.error is True:
             self.log.error('pixiv api error: %s', post.message)

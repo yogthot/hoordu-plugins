@@ -273,20 +273,23 @@ class GDrive(SimplePluginBase):
         create_time = dateutil.parser.parse(node.createdTime).astimezone(timezone.utc)
         
         if remote_post is None:
-            remote_post = self.session.query(RemotePost).filter(RemotePost.source_id == self.source.id, RemotePost.original_id == original_id).one_or_none()
-            if remote_post is None:
-                remote_post = RemotePost(
-                    source=self.source,
-                    original_id=original_id,
-                    title=node.name,
-                    url=url,
-                    type=PostType.set,
-                    post_time=create_time
-                )
-                self.session.add(remote_post)
-                
-            else:
-                self.log.info('post already exists: %s', remote_post.id)
+            remote_post = self._get_post(original_id)
+        
+        if remote_post is None:
+            remote_post = RemotePost(
+                source=self.source,
+                original_id=original_id,
+                title=node.name,
+                url=url,
+                type=PostType.set,
+                post_time=create_time
+            )
+            
+            self.session.add(remote_post)
+            self.session.flush()
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
         
         current_files = {file.metadata_: file for file in remote_post.files}
         
@@ -302,7 +305,7 @@ class GDrive(SimplePluginBase):
             need_orig = not file.present and not preview
             
             if need_orig:
-                self.log.info('downloading file for post: %s', remote_post.id)
+                self.log.info(f'downloading file: {file.remote_order}')
                 
                 orig = self._download_file(node)
                 
@@ -319,7 +322,6 @@ class GDrive(SimplePluginBase):
                     file = File(remote=remote_post, remote_order=order, filename=path, metadata_=id)
                     self.session.add(file)
                     self.session.flush()
-                    self.log.info('found new file for post %s, file order: %s', remote_post.id, order)
                     
                 else:
                     file.filename = path
@@ -329,7 +331,7 @@ class GDrive(SimplePluginBase):
                 need_orig = not file.present and not preview
                 
                 if need_orig:
-                    self.log.info('downloading file for post: %s', remote_post.id)
+                    self.log.info(f'downloading file: {file.remote_order}')
                     
                     orig = self._download_file(n)
                     
