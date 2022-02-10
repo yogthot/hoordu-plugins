@@ -22,7 +22,7 @@ CREATOR_GET_URL = 'https://api.fanbox.cc/creator.get?creatorId={creator}'
 CREATOR_URL_REGEXP = re.compile('https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/', flags=re.IGNORECASE)
 PIXIV_URL = 'https://www.pixiv.net/en/users/{pixiv_id}'
 
-POST_FORMAT = 'https://fanbox.cc/@/posts/{post_id}'
+POST_FORMAT = 'https://fanbox.cc/@{creator}/posts/{post_id}'
 POST_REGEXP = [
     re.compile('^https?:\/\/(?P<creator>[^\.]+)\.fanbox\.cc\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE),
     re.compile('^https?:\/\/(?:www\.)?fanbox\.cc\/@(?P<creator>[^\/]*)\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
@@ -273,7 +273,7 @@ class Fanbox(SimplePluginBase):
             remote_post = RemotePost(
                 source=self.source,
                 original_id=main_id,
-                url=POST_FORMAT.format(post_id=main_id),
+                url=POST_FORMAT.format(creator=creator_slug, post_id=main_id),
                 title=post.title,
                 type=PostType.collection,
                 post_time=post_time,
@@ -503,7 +503,7 @@ class Fanbox(SimplePluginBase):
         self.log.debug('post json: %s', post)
         
         if post.body is None:
-            self.log.warning('inaccessible post %s', main_id)
+            self.log.warning('inaccessible post %s', id)
             return None
         
         return self._to_remote_post(post, remote_post=remote_post, preview=preview)
