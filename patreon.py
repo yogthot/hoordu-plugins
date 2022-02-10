@@ -323,12 +323,13 @@ class Patreon(SimplePluginBase):
         
         images = post_obj.relationships.images.data or []
         attachments = post_obj.relationships.attachments.data or []
-        audios = []
         
-        if post_obj.relationships.audio.data is not None:
-            raise BaseException(f'post id {post_id} appears to contain audio')
+        audio = []
+        audio_data = post_obj.relationships.audio.data
+        if audio_data is not None:
+            audio = [audio_data]
         
-        for data, order in zip(itertools.chain(images, audios, attachments), itertools.count(1)):
+        for data, order in zip(itertools.chain(images, audio, attachments), itertools.count(1)):
             id = f'{data.type}-{data.id}'
             attributes = included[data].attributes
             
