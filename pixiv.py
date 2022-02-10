@@ -24,13 +24,13 @@ POST_FORMAT = 'https://www.pixiv.net/artworks/{post_id}'
 FANBOX_URL_FORMAT = 'https://www.pixiv.net/fanbox/creator/{user_id}'
 POST_REGEXP = [
     re.compile('^(?P<post_id>\d+)_p\d+\.[a-zA-Z0-9]+$'),
-    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?artworks\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
+    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/(?:[a-zA-Z]{2}\/)?artworks\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 USER_REGEXP = [
-    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)(?:\/illustration|\/manga)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
+    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/(?:[a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)(?:\/illustration|\/manga)?(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 BOOKMARKS_REGEXP = [
-    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/([a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)\/bookmarks\/artworks(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
+    re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/(?:[a-zA-Z]{2}\/)?users\/(?P<user_id>\d+)\/bookmarks\/artworks(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
 ]
 REDIRECT_REGEXP = re.compile('^https?:\/\/(?:www\.)?pixiv\.net\/jump\.php\?(?P<url>.*)$', flags=re.IGNORECASE)
 
