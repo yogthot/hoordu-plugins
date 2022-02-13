@@ -30,7 +30,9 @@ SUPPORT_URL_REGEXP = re.compile('^https?:\/\/support\.twitter\.com\/.*$', re.IGN
 URL_REGEXP = re.compile('https?:\/\/t\.co\/[0-9a-z]+', flags=re.IGNORECASE)
 PROFILE_IMAGE_REGEXP = re.compile('^(?P<base>.+_)(?P<size>[^\.]+)(?P<ext>.+)$')
 
-MEDIA_URL = '{base_url}?format={ext}&name={size}'
+NEW_MEDIA_URL = '{base_url}?format={ext}&name={size}'
+OLD_MEDIA_URL = '{base_url}.{ext}:{size}'
+MEDIA_URL = NEW_MEDIA_URL
 
 # these options are appended to the end of image urls when downloading
 THUMB_SIZE = 'small'
@@ -214,18 +216,18 @@ class Twitter(SimplePluginBase):
     
     @classmethod
     def setup(cls, session, parameters=None):
-        source = cls.get_source(session)
+        plugin = cls.get_plugin(session)
         
         # check if everything is ready to use
-        config = hoordu.Dynamic.from_json(source.config)
+        config = hoordu.Dynamic.from_json(plugin.config)
         
         if not config.defined('consumer_key', 'consumer_secret'):
             # try to get the values from the parameters
             if parameters is not None:
                 config.update(parameters)
                 
-                source.config = config.to_json()
-                session.add(source)
+                plugin.config = config.to_json()
+                session.add(plugin)
         
         if not config.defined('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
@@ -241,8 +243,8 @@ class Twitter(SimplePluginBase):
                 
                 config.oauth_token = oauth_token
                 config.oauth_token_secret = oauth_token_secret
-                source.config = config.to_json()
-                session.add(source)
+                plugin.config = config.to_json()
+                session.add(plugin)
                 
                 oauth_form = Form('twitter authentication',
                     Label('please login to twitter via this url to get your pin:\n{}'.format(url)),
@@ -262,8 +264,8 @@ class Twitter(SimplePluginBase):
                     
                 config.access_token_key = access_token_key
                 config.access_token_secret = access_token_secret
-                source.config = config.to_json()
-                session.add(source)
+                plugin.config = config.to_json()
+                session.add(plugin)
                 
                 return True, None
             
@@ -273,14 +275,14 @@ class Twitter(SimplePluginBase):
     
     @classmethod
     def update(cls, session):
-        source = cls.get_source(session)
+        plugin = cls.get_plugin(session)
         
-        if source.version < cls.version:
+        if plugin.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
-            source.version = cls.version
-            session.add(source)
+            plugin.version = cls.version
+            session.add(plugin)
     
     @classmethod
     def parse_url(cls, url):
@@ -311,12 +313,14 @@ class Twitter(SimplePluginBase):
         super().__init__(session)
         
         self.http = urllib3.PoolManager()
-        
+        self._init_api()
+    
+    def _init_api(self):
         self.api = twitter.Api(
             consumer_key=self.config.consumer_key,
             consumer_secret=self.config.consumer_secret,
-            access_token_key=self.config.access_token_key,
-            access_token_secret=self.config.access_token_secret,
+            access_token_key=self.config.get('access_token_key'),
+            access_token_secret=self.config.get('access_token_secret'),
             tweet_mode='extended'
         )
     
@@ -362,8 +366,8 @@ class Twitter(SimplePluginBase):
         
         return final_url
     
-    def _download_media_file(self, base_url, ext, size, filename=None):
-        return self.session.download(MEDIA_URL.format(base_url=base_url, ext=ext, size=size), suffix=filename)[0]
+    def _download_media_file(self, base_url, ext, size, filename=None, template=MEDIA_URL):
+        return self.session.download(template.format(base_url=base_url, ext=ext, size=size), suffix=filename)[0]
     
     def _download_video(self, media):
         variants = media.video_info.get('variants', [])

@@ -15,14 +15,14 @@ class Ascii2D(ReverseSearchPluginBase):
     
     @classmethod
     def update(cls, session):
-        source = cls.get_source(session)
+        plugin = cls.get_plugin(session)
         
-        if source.version < cls.version:
+        if plugin.version < cls.version:
             # update anything if needed
             
             # if anything was updated, then the db entry should be updated as well
-            source.version = cls.version
-            session.add(source)
+            plugin.version = cls.version
+            session.add(plugin)
     
     def __init__(self, session):
         super().__init__(session)
