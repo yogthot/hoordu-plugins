@@ -42,6 +42,33 @@ class CreatorIterator(IteratorBase):
         
         super().reconfigure(direction=direction, num_posts=num_posts)
     
+    def _recover_head(self):
+        response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id))
+        response.raise_for_status()
+        fanclub = hoordu.Dynamic.from_json(response.text).fanclub
+        
+        if not fanclub.recent_posts:
+            return
+        
+        post_id = fanclub.recent_posts[0].id
+        head_id = post_id
+        
+        while post_id > self.state.head_id:
+            response = self.http.get(POST_GET_URL.format(post_id=post_id))
+            response.raise_for_status()
+            post = hoordu.Dynamic.from_json(response.text).post
+            
+            yield post
+            
+            next_post = post.links.previous
+            if next_post is None:
+                self.state.tail_id = post.id
+                break
+            
+            post_id = next_post.id
+        
+        self.state.head_id = head_id
+    
     def _post_iterator(self):
         post_id = self.state.head_id if self.direction == FetchDirection.newer else self.state.tail_id
         
@@ -58,18 +85,24 @@ class CreatorIterator(IteratorBase):
             self.state.tail_id = post_id
             
         else:
-            # TODO the post might have been deleted
-            # there's no issue if we get all the posts from the beginning up until the head
-            # but there's no way to start at the end without going through everything again
             response = self.http.get(POST_GET_URL.format(post_id=post_id))
-            response.raise_for_status()
-            post = hoordu.Dynamic.from_json(response.text).post
-            
-            next_post = post.links.next if self.direction == FetchDirection.newer else post.links.previous
-            if next_post is None:
+            was_deleted = (response.status_code == 404)
+            if not was_deleted:
+                response.raise_for_status()
+                post = hoordu.Dynamic.from_json(response.text).post
+                
+                next_post = post.links.next if self.direction == FetchDirection.newer else post.links.previous
+                if next_post is None:
+                    return
+                
+                post_id = next_post.id
+                
+            elif self.direction == FetchDirection.newer:
+                yield from self._recover_head()
                 return
-            
-            post_id = next_post.id
+                
+            else:
+                raise Exception('tail post was deleted, recover functionality not implemented')
         
         # iter(int, 1) -> infinite iterator
         it = range(self.num_posts) if self.num_posts is not None else iter(int, 1)
