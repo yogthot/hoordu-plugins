@@ -19,7 +19,7 @@ SCOPES = 'https://www.googleapis.com/auth/drive.readonly'
 FOLDER_FORMAT = 'https://drive.google.com/drive/folders/{file_id}'
 FILE_FORMAT = 'https://drive.google.com/file/d/{file_id}'
 FILE_REGEXP = [
-    re.compile('^https?:\/\/drive\.google\.com\/drive\/folders\/(?P<file_id>[^\/\?]+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE),
+    re.compile('^https?:\/\/drive\.google\.com\/drive\/(u\/\d+\/)?folders\/(?P<file_id>[^\/\?]+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE),
     re.compile('^https?:\/\/drive\.google\.com\/file\/d\/(?P<file_id>[^\/\?]+)(?:\/.*)?(?:\?.*)?$', flags=re.IGNORECASE)
 ]
 
