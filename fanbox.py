@@ -121,9 +121,7 @@ class CreatorIterator(IteratorBase):
                 if min_id is not None and id <= min_id:
                     return
                 
-                # posts the user has no access to have no body
-                if post.body is not None:
-                    yield post
+                yield post
                 
                 max_id = id - 1
                 max_datetime = post.publishedDatetime
@@ -143,7 +141,12 @@ class CreatorIterator(IteratorBase):
     
     def _generator(self):
         for post in self._post_iterator():
-            remote_post = self.plugin._to_remote_post(post, preview=self.subscription is None)
+            
+            response = self.http.get(POST_GET_URL.format(post_id=post.id))
+            response.raise_for_status()
+            post_body = hoordu.Dynamic.from_json(response.text).body
+            
+            remote_post = self.plugin._to_remote_post(post_body, preview=self.subscription is None)
             yield remote_post
             
             if self.subscription is not None:
@@ -308,85 +311,10 @@ class Fanbox(SimplePluginBase):
         current_files = {file.metadata_: file for file in remote_post.files}
         current_urls = [r.url for r in remote_post.related]
         
-        if post.type == 'image':
-            for image, order in zip(post.body.images, itertools.count(1)):
-                id = 'i-{}'.format(image.id)
-                file = current_files.get(id)
-                
-                if file is None:
-                    file = File(remote=remote_post, remote_order=order, metadata_=id)
-                    self.session.add(file)
-                    self.session.flush()
-                    
-                else:
-                    file.remote_order = order
-                    self.session.add(file)
-                
-                need_orig = not file.present and not preview
-                need_thumb = not file.thumb_present
-                
-                if need_thumb or need_orig:
-                    self.log.info(f'downloading file: {file.remote_order}')
-                    
-                    orig = self._download_file(image.originalUrl) if need_orig else None
-                    thumb = self._download_file(image.thumbnailUrl) if need_thumb else None
-                    
-                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
-            
-            remote_post.comment = post.body.text
-            self.session.add(remote_post)
-            
-        elif post.type == 'file':
-            for rfile, order in zip(post.body.files, itertools.count(1)):
-                id = 'f-{}'.format(rfile.id)
-                file = current_files.get(id)
-                
-                if file is None:
-                    filename = '{0.name}.{0.extension}'.format(rfile)
-                    file = File(remote=remote_post, remote_order=order, filename=filename, metadata_=id)
-                    self.session.add(file)
-                    self.session.flush()
-                    
-                else:
-                    file.remote_order = order
-                    self.session.add(file)
-                
-                need_orig = not file.present and not preview
-                
-                if need_orig:
-                    self.log.info(f'downloading file: {file.remote_order}')
-                    
-                    orig = self._download_file(rfile.url)
-                    
-                    self.session.import_file(file, orig=orig, move=True)
-            
-            remote_post.comment = post.body.text
-            self.session.add(remote_post)
-            
-        elif post.type == 'article':
-            imagemap = post.body.get('imageMap')
-            filemap = post.body.get('fileMap')
-            embedmap = post.body.get('embedMap')
-            
-            order = 1
-            
-            blog = []
-            for block in post.body.blocks:
-                if block.type in ('p', 'header'):
-                    links = block.get('links')
-                    if links is not None:
-                        for link in links:
-                            url = link.url
-                            if url not in current_urls:
-                                remote_post.add_related_url(url)
-                    
-                    blog.append({
-                        'type': 'text',
-                        'content': block.text + '\n'
-                    })
-                    
-                elif block.type == 'image':
-                    id = 'i-{}'.format(block.imageId)
+        if not post.isRestricted:
+            if post.type == 'image':
+                for image, order in zip(post.body.images, itertools.count(1)):
+                    id = 'i-{}'.format(image.id)
                     file = current_files.get(id)
                     
                     if file is None:
@@ -398,95 +326,201 @@ class Fanbox(SimplePluginBase):
                         file.remote_order = order
                         self.session.add(file)
                     
-                    orig_url = imagemap[block.imageId].originalUrl
-                    thumb_url = imagemap[block.imageId].thumbnailUrl
-                    
                     need_orig = not file.present and not preview
                     need_thumb = not file.thumb_present
                     
                     if need_thumb or need_orig:
                         self.log.info(f'downloading file: {file.remote_order}')
                         
-                        orig = self._download_file(orig_url) if need_orig else None
-                        thumb = self._download_file(thumb_url) if need_thumb else None
+                        orig = self._download_file(image.originalUrl) if need_orig else None
+                        thumb = self._download_file(image.thumbnailUrl) if need_thumb else None
                         
                         self.session.import_file(file, orig=orig, thumb=thumb, move=True)
-                    
-                    blog.append({
-                        'type': 'file',
-                        'metadata': id
-                    })
-                    
-                    order += 1
-                    
-                elif block.type == 'file':
-                    id = 'f-{}'.format(block.fileId)
+                
+                remote_post.comment = post.body.text
+                self.session.add(remote_post)
+                
+            elif post.type == 'file':
+                for rfile, order in zip(post.body.files, itertools.count(1)):
+                    id = 'f-{}'.format(rfile.id)
                     file = current_files.get(id)
                     
                     if file is None:
-                        file = File(remote=remote_post, remote_order=order, metadata_=id)
+                        filename = '{0.name}.{0.extension}'.format(rfile)
+                        file = File(remote=remote_post, remote_order=order, filename=filename, metadata_=id)
                         self.session.add(file)
                         self.session.flush()
-                    
-                    orig_url = filemap[block.fileId].url
-                    thumb_url = post.coverImageUrl
-                    
-                    need_orig = not file.present and not preview
-                    need_thumb = not file.thumb_present and thumb_url is not None
-                    
-                    if need_thumb or need_orig:
-                        self.log.info(f'downloading file: {file.remote_order}')
-                        
-                        orig = self._download_file(orig_url) if need_orig else None
-                        thumb = self._download_file(thumb_url) if need_thumb else None
-                        
-                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
-                    
-                    blog.append({
-                        'type': 'file',
-                        'metadata': id
-                    })
-                    
-                    order += 1
-                    
-                elif block.type == 'embed':
-                    embed = embedmap[block.embedId]
-                    
-                    if embed.serviceProvider == 'fanbox':
-                        related_post_id = embed.contentId.split('/')[-1]
-                        url = POST_FORMAT.format(post_id=related_post_id)
-                        
-                    elif embed.serviceProvider == 'google_forms':
-                        url = 'https://docs.google.com/forms/d/e/{}/viewform'.format(embed.contentId)
-                        
-                    elif embed.serviceProvider == 'twitter':
-                        url = 'https://twitter.com/i/web/status/{}'.format(embed.contentId)
                         
                     else:
-                        raise NotImplementedError('unknown embed service provider: {}'.format(embed.serviceProvider))
+                        file.remote_order = order
+                        self.session.add(file)
                     
-                    if url not in current_urls:
-                        remote_post.add_related_url(url)
+                    need_orig = not file.present and not preview
                     
-                    blog.append({
-                        'type': 'text',
-                        'content': url + '\n'
-                    })
-                    
-                else:
-                    self.log.warning('unknown blog block: %s', str(block.type))
-            
-            remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
-            remote_post.type = PostType.blog
-            self.session.add(remote_post)
-            
-        elif post.type == 'text':
-            remote_post.comment = post.body.text
-            remote_post.type = PostType.set
-            self.session.add(remote_post)
+                    if need_orig:
+                        self.log.info(f'downloading file: {file.remote_order}')
+                        
+                        orig = self._download_file(rfile.url)
+                        
+                        self.session.import_file(file, orig=orig, move=True)
+                
+                remote_post.comment = post.body.text
+                self.session.add(remote_post)
+                
+            elif post.type == 'article':
+                imagemap = post.body.get('imageMap')
+                filemap = post.body.get('fileMap')
+                embedmap = post.body.get('embedMap')
+                urlembedmap = post.body.get('urlEmbedMap')
+                
+                order = 1
+                
+                blog = []
+                for block in post.body.blocks:
+                    if block.type in ('p', 'header'):
+                        links = block.get('links')
+                        if links is not None:
+                            for link in links:
+                                url = link.url
+                                if url not in current_urls:
+                                    remote_post.add_related_url(url)
+                        
+                        blog.append({
+                            'type': 'text',
+                            'content': block.text + '\n'
+                        })
+                        
+                    elif block.type == 'image':
+                        id = 'i-{}'.format(block.imageId)
+                        file = current_files.get(id)
+                        
+                        if file is None:
+                            file = File(remote=remote_post, remote_order=order, metadata_=id)
+                            self.session.add(file)
+                            self.session.flush()
+                            
+                        else:
+                            file.remote_order = order
+                            self.session.add(file)
+                        
+                        orig_url = imagemap[block.imageId].originalUrl
+                        thumb_url = imagemap[block.imageId].thumbnailUrl
+                        
+                        need_orig = not file.present and not preview
+                        need_thumb = not file.thumb_present
+                        
+                        if need_thumb or need_orig:
+                            self.log.info(f'downloading file: {file.remote_order}')
+                            
+                            orig = self._download_file(orig_url) if need_orig else None
+                            thumb = self._download_file(thumb_url) if need_thumb else None
+                            
+                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                        
+                        blog.append({
+                            'type': 'file',
+                            'metadata': id
+                        })
+                        
+                        order += 1
+                        
+                    elif block.type == 'file':
+                        id = 'f-{}'.format(block.fileId)
+                        file = current_files.get(id)
+                        
+                        if file is None:
+                            file = File(remote=remote_post, remote_order=order, metadata_=id)
+                            self.session.add(file)
+                            self.session.flush()
+                        
+                        orig_url = filemap[block.fileId].url
+                        thumb_url = post.coverImageUrl
+                        
+                        need_orig = not file.present and not preview
+                        need_thumb = not file.thumb_present and thumb_url is not None
+                        
+                        if need_thumb or need_orig:
+                            self.log.info(f'downloading file: {file.remote_order}')
+                            
+                            orig = self._download_file(orig_url) if need_orig else None
+                            thumb = self._download_file(thumb_url) if need_thumb else None
+                            
+                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                        
+                        blog.append({
+                            'type': 'file',
+                            'metadata': id
+                        })
+                        
+                        order += 1
+                        
+                    elif block.type == 'embed':
+                        embed = embedmap[block.embedId]
+                        
+                        url = None
+                        if embed.serviceProvider == 'fanbox':
+                            related_post_id = embed.contentId.split('/')[-1]
+                            # TODO fix this if it's still a thing
+                            url = POST_FORMAT.format(post_id=related_post_id)
+                            
+                        elif embed.serviceProvider == 'google_forms':
+                            url = 'https://docs.google.com/forms/d/e/{}/viewform'.format(embed.contentId)
+                            
+                        elif embed.serviceProvider == 'twitter':
+                            url = 'https://twitter.com/i/web/status/{}'.format(embed.contentId)
+                            
+                        else:
+                            self.log.warning('unknown embed service provider: %s', str(embed.serviceProvider))
+                        
+                        if url:
+                            if url not in current_urls:
+                                remote_post.add_related_url(url)
+                            
+                            blog.append({
+                                'type': 'text',
+                                'content': url + '\n'
+                            })
+                        
+                    elif block.type == 'url_embed':
+                        urlembed = urlembedmap[block.urlEmbedId]
+                        
+                        url = None
+                        if urlembed.type == 'fanbox.post':
+                            related_post_id = urlembed.postInfo.id
+                            related_creator_id = urlembed.postInfo.creatorId
+                            url = POST_FORMAT.format(creator=related_creator_id, post_id=related_post_id)
+                            
+                        else:
+                            self.log.warning('unknown url_embed type: %s', str(urlembed.type))
+                        
+                        if url:
+                            if url not in current_urls:
+                                remote_post.add_related_url(url)
+                            
+                            blog.append({
+                                'type': 'text',
+                                'content': url + '\n'
+                            })
+                        
+                    else:
+                        self.log.warning('unknown blog block: %s', str(block.type))
+                
+                remote_post.comment = hoordu.Dynamic({'comment': blog}).to_json()
+                remote_post.type = PostType.blog
+                self.session.add(remote_post)
+                
+            elif post.type == 'text':
+                remote_post.comment = post.body.text
+                remote_post.type = PostType.set
+                self.session.add(remote_post)
+                
+            else:
+                raise NotImplementedError('unknown post type: {}'.format(post.type))
             
         else:
-            raise NotImplementedError('unknown post type: {}'.format(post.type))
+            # restrited post (body is null)
+            pass
+            
         
         return remote_post
     
@@ -502,9 +536,8 @@ class Fanbox(SimplePluginBase):
         post = hoordu.Dynamic.from_json(response.text).body
         self.log.debug('post json: %s', post)
         
-        if post.body is None:
+        if post.isRestricted:
             self.log.warning('inaccessible post %s', id)
-            return None
         
         return self._to_remote_post(post, remote_post=remote_post, preview=preview)
     
@@ -521,12 +554,11 @@ class Fanbox(SimplePluginBase):
         response = self.http.get(CREATOR_GET_URL.format(creator=creator_id))
         response.raise_for_status()
         creator = hoordu.Dynamic.from_json(response.text).body
-        
         options.creator = creator_id
         options.pixiv_id = creator.user.userId
         
         related_urls = creator.profileLinks
-        related_urls.append(PIXIV_URL.format(pixiv_id=pixiv_id))
+        related_urls.append(PIXIV_URL.format(pixiv_id=options.pixiv_id))
         
         return SearchDetails(
             hint=creator.creatorId,
