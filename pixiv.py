@@ -189,22 +189,27 @@ class BookmarkIterator(IteratorBase):
                     continue
                 
                 response = self.http.get(POST_GET_URL.format(post_id=post_id))
-                response.raise_for_status()
-                post = hoordu.Dynamic.from_json(response.text)
-                
-                if post.error is True:
-                    raise APIError(post.message)
-                
-                remote_post = self.plugin._to_remote_post(post.body, preview=self.subscription is None)
-                yield remote_post
+                # skip this post if 404 (deleted bookmarks)
+                was_deleted = (response.status_code == 404)
+                if not was_deleted:
+                    response.raise_for_status()
+                    post = hoordu.Dynamic.from_json(response.text)
+                    
+                    if post.error is True:
+                        raise APIError(post.message)
+                    
+                    remote_post = self.plugin._to_remote_post(post.body, preview=self.subscription is None)
+                    yield remote_post
                 
                 if self.direction == FetchDirection.older:
                     self.state.tail_id = bookmark.bookmarkData.id
                     self.state.offset += 1
                 
-                total +=1
-                if self.num_posts is not None and total >= self.num_posts:
-                    return
+                if not was_deleted:
+                    total +=1
+                    
+                    if self.num_posts is not None and total >= self.num_posts:
+                        return
             
             first_iteration = False
     
