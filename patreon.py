@@ -346,10 +346,14 @@ class Patreon(SimplePluginBase):
                 if attributes.state != 'ready':
                     continue
                 
+                # skip embeded image, url has been saved instead
+                if post.post_type == 'link' and attributes.owner_relationship == 'main':
+                    continue
+                
                 orig_url = attributes.image_urls.original
                 thumb_url = attributes.image_urls.default
                 
-                if post.post_type != 'video_embed':
+                if post.post_type not in ('video_embed'):
                     orig_filename = attributes.file_name
             
             file = current_files.get(id)
