@@ -20,7 +20,7 @@ class TwitterNoAuth(Twitter):
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.defined('consumer_key', 'consumer_secret'):
+        if not config.contains('consumer_key', 'consumer_secret'):
             # try to get the values from the parameters
             if parameters is not None:
                 config.update(parameters)
@@ -28,7 +28,7 @@ class TwitterNoAuth(Twitter):
                 plugin.config = config.to_json()
                 session.add(plugin)
         
-        if not config.defined('consumer_key', 'consumer_secret'):
+        if not config.contains('consumer_key', 'consumer_secret'):
             # but if they're still None, the api can't be used
             return False, cls.config_form()
             

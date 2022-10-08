@@ -249,7 +249,7 @@ class Pixiv(SimplePluginBase):
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.defined('PHPSESSID'):
+        if not config.contains('PHPSESSID'):
             # try to get the values from the parameters
             if parameters is not None:
                 config.update(parameters)
@@ -257,7 +257,7 @@ class Pixiv(SimplePluginBase):
                 plugin.config = config.to_json()
                 session.add(plugin)
         
-        if not config.defined('PHPSESSID'):
+        if not config.contains('PHPSESSID'):
             # but if they're still None, the api can't be used
             return False, cls.config_form()
             
@@ -415,7 +415,7 @@ class Pixiv(SimplePluginBase):
             remote_tag = self._get_tag(TagCategory.general, tag.tag)
             remote_post.add_tag(remote_tag)
             
-            if tag.defined('romaji') and remote_tag.update_metadata('romaji', tag.romaji):
+            if tag.contains('romaji') and remote_tag.update_metadata('romaji', tag.romaji):
                 self.session.add(remote_tag)
         
         if post.xRestrict >= 1:

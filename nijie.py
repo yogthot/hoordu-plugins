@@ -141,7 +141,7 @@ class Pixiv(SimplePluginBase):
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.defined('NIJIEIJIEID', 'nijie_tok'):
+        if not config.contains('NIJIEIJIEID', 'nijie_tok'):
             # try to get the values from the parameters
             if parameters is not None:
                 config.update(parameters)
@@ -149,7 +149,7 @@ class Pixiv(SimplePluginBase):
                 plugin.config = config.to_json()
                 session.add(plugin)
         
-        if not config.defined('NIJIEIJIEID', 'nijie_tok'):
+        if not config.contains('NIJIEIJIEID', 'nijie_tok'):
             # but if they're still None, the api can't be used
             return False, cls.config_form()
             

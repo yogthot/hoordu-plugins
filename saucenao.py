@@ -22,13 +22,13 @@ class SauceNao(ReverseSearchPluginBase):
         plugin = cls.get_plugin(session)
         
         config = hoordu.Dynamic.from_json(plugin.config)
-        if not config.defined('api_key'):
+        if not config.contains('api_key'):
             if parameters is not None:
                 config.update(parameters)
                 plugin.config = config.to_json()
                 session.add(plugin)
         
-        if not config.defined('api_key'):
+        if not config.contains('api_key'):
             return False, cls.config_form()
             
         else:
