@@ -9,11 +9,13 @@ import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
-from hoordu.plugins.oauth import *
+from hoordu.oauth.client import *
 
+#654966623148-ogmcppkpa0s5v8fpnvqceik1f5b7i667.apps.googleusercontent.com
+#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
 AUTH_URL = 'https://accounts.google.com/o/oauth2/auth'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
-REDIRECT_URL = 'urn:ietf:wg:oauth:2.0:oob'
+REDIRECT_URL = 'http://127.0.0.1:8941/gdrive'
 SCOPES = 'https://www.googleapis.com/auth/drive.readonly'
 
 FOLDER_FORMAT = 'https://drive.google.com/drive/folders/{file_id}'
@@ -130,25 +132,20 @@ class GDrive(SimplePluginBase):
             oauth = OAuth({
                 'auth_url': AUTH_URL,
                 'token_url': TOKEN_URL,
-                'callback_url': REDIRECT_URL,
+                'redirect_uri': REDIRECT_URL,
                 'scopes': SCOPES,
                 'client_id': config.client_id,
                 'client_secret': config.client_secret
             })
             
             if code is None:
-                url = oauth.auth_url()
+                url = oauth.auth_url(extra_args={'access_type': 'offline'})
                 
-                oauth_form = Form('google authentication',
-                    Label('please login to google via this url to get your authorization code:\n{}'.format(url)),
-                    ('code', Input('code', [validators.required]))
-                )
-                
-                return False, oauth_form
+                return False, OAuthForm('google authentication', url)
                 
             else:
                 response = oauth.get_access_token(code)
-                
+                print(response)
                 config.access_token = response['access_token']
                 config.refresh_token = response['refresh_token']
                 plugin.config = config.to_json()
@@ -188,7 +185,7 @@ class GDrive(SimplePluginBase):
         self.oauth = OAuth({
             'auth_url': AUTH_URL,
             'token_url': TOKEN_URL,
-            'callback_url': REDIRECT_URL,
+            'redirect_uri': REDIRECT_URL,
             'scopes': SCOPES,
             'client_id': self.config.client_id,
             'client_secret': self.config.client_secret
