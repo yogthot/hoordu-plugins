@@ -1,6 +1,7 @@
 import re
+import re
 import itertools
-import requests
+import aiohttp
 from datetime import datetime, timezone
 import dateutil.parser
 from natsort import natsorted
@@ -10,9 +11,9 @@ from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
 from hoordu.oauth.client import *
+from hoordu.http.requests import HTTPError
 
-#654966623148-ogmcppkpa0s5v8fpnvqceik1f5b7i667.apps.googleusercontent.com
-#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
+
 AUTH_URL = 'https://accounts.google.com/o/oauth2/auth'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 REDIRECT_URL = 'http://127.0.0.1:8941/gdrive'
@@ -32,20 +33,30 @@ class Drive:
     def __init__(self, access_token, refresh_token_cb):
         self.access_token = access_token
         self.refresh_token_cb = refresh_token_cb
-        self.http = requests.Session()
+        self.http = aiohttp.ClientSession()
         self.http.headers['Authorization'] = f'Bearer {access_token}'
     
-    def _get(self, url, *args, **kwargs):
-        resp = self.http.get(url, *args, **kwargs)
-        
-        if resp.status_code == 401:
-            self.access_token = self.refresh_token_cb()
+    async def __aenter__(self) -> 'Drive':
+        await self.http.__aenter__()
+        return self
+    
+    async def __aexit__(self, *args):
+        return await self.http.__aexit__(*args)
+    
+    @contextlib.asynccontextmanager
+    async def _get(self, *args, **kwargs):
+        async with self.http.get(*args, **kwargs) as resp:
+            if resp.status == 401:
+                self.access_token = await self.refresh_token_cb()
+                
+                self.http.headers['Authorization'] = f'Bearer {self.access_token}'
+                
+                async with self.http.get(*args, **kwargs) as resp_retry:
+                    yield resp_retry
+                    return
             
-            self.http.headers['Authorization'] = f'Bearer {self.access_token}'
-            
-            resp = self.http.get(url, *args, **kwargs)
-        
-        return resp
+            yield resp
+            return
     
     def is_link(self, f):
         return f.mimeType == 'application/vnd.google-apps.shortcut'
@@ -53,7 +64,7 @@ class Drive:
     def is_dir(self, f):
         return f.mimeType == 'application/vnd.google-apps.folder'
     
-    def folder(self, id):
+    async def folder(self, id):
         page_token = None
         
         while True:
@@ -66,8 +77,8 @@ class Drive:
             if page_token is not None:
                 args['pageToken'] = page_token
             
-            resp = self._get(f'{self.ENDPOINT}/files', params=args)
-            files = hoordu.Dynamic.from_json(resp.text)
+            async with self._get(f'{self.ENDPOINT}/files', params=args) as resp:
+                files = hoordu.Dynamic.from_json(await resp.text())
             
             for f in files.files:
                 if self.is_link(f):
@@ -81,18 +92,18 @@ class Drive:
             if page_token is None:
                 return
     
-    def file(self, id):
+    async def file(self, id):
         args = {
             'fields': 'id, name, mimeType, createdTime, thumbnailLink, shortcutDetails'
         }
-        resp = self._get(f'{self.ENDPOINT}/files/{id}', params=args)
-        return hoordu.Dynamic.from_json(resp.text)
+        async with self._get(f'{self.ENDPOINT}/files/{id}', params=args) as resp:
+            return hoordu.Dynamic.from_json(await resp.text())
     
     def file_url(self, file):
         return f'{self.ENDPOINT}/files/{file.id}?alt=media'
 
 
-class GDrive(SimplePluginBase):
+class GDrive(SimplePlugin):
     name = 'gdrive'
     version = 1
     
@@ -106,19 +117,18 @@ class GDrive(SimplePluginBase):
         )
     
     @classmethod
-    def setup(cls, session, parameters=None):
-        plugin = cls.get_plugin(session)
+    async def setup(cls, session, parameters=None):
+        plugin = await cls.get_plugin(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.contains('client_id', 'client_secret'):
-            # try to get the values from the parameters
-            if parameters is not None:
-                config.update(parameters)
-                
-                plugin.config = config.to_json()
-                session.add(plugin)
+        # use values from the parameters if they were passed
+        if parameters is not None:
+            config.update(parameters)
+            
+            plugin.config = config.to_json()
+            session.add(plugin)
         
         if not config.contains('client_id', 'client_secret'):
             # but if they're still None, the api can't be used
@@ -129,7 +139,7 @@ class GDrive(SimplePluginBase):
             if parameters is not None:
                 code = parameters.get('code')
             
-            oauth = OAuth({
+            oauth = OAuth(**{
                 'auth_url': AUTH_URL,
                 'token_url': TOKEN_URL,
                 'redirect_uri': REDIRECT_URL,
@@ -139,13 +149,12 @@ class GDrive(SimplePluginBase):
             })
             
             if code is None:
-                url = oauth.auth_url(extra_args={'access_type': 'offline'})
+                url, _, _ = oauth.auth_url(extra_args={'access_type': 'offline'})
                 
                 return False, OAuthForm('google authentication', url)
                 
             else:
-                response = oauth.get_access_token(code)
-                print(response)
+                response = await oauth.get_access_token(code)
                 config.access_token = response['access_token']
                 config.refresh_token = response['refresh_token']
                 plugin.config = config.to_json()
@@ -158,8 +167,8 @@ class GDrive(SimplePluginBase):
             return True, None
     
     @classmethod
-    def update(cls, session):
-        plugin = cls.get_plugin(session)
+    async def update(cls, session):
+        plugin = await cls.get_plugin(session)
         
         if plugin.version < cls.version:
             # update anything if needed
@@ -169,7 +178,7 @@ class GDrive(SimplePluginBase):
             session.add(plugin)
     
     @classmethod
-    def parse_url(cls, url):
+    async def parse_url(cls, url):
         for regexp in FILE_REGEXP:
             match = regexp.match(url)
             if match:
@@ -177,86 +186,97 @@ class GDrive(SimplePluginBase):
         
         return None
     
-    def __init__(self, session):
-        super().__init__(session)
-        
-        self.http = urllib3.PoolManager()
-        
-        self.oauth = OAuth({
-            'auth_url': AUTH_URL,
-            'token_url': TOKEN_URL,
-            'redirect_uri': REDIRECT_URL,
-            'scopes': SCOPES,
-            'client_id': self.config.client_id,
-            'client_secret': self.config.client_secret
-        })
-        
-        self.api = Drive(self.config.access_token, self._refresh_token)
+    @contextlib.asynccontextmanager
+    async def context(self):
+        async with super().context():
+            self.oauth = OAuth(**{
+                'auth_url': AUTH_URL,
+                'token_url': TOKEN_URL,
+                'redirect_uri': REDIRECT_URL,
+                'scopes': SCOPES,
+                'client_id': self.config.client_id,
+                'client_secret': self.config.client_secret
+            })
+            
+            async with Drive(self.config.access_token, self._refresh_token) as api:
+                self.api: Drive = api
+                yield self
     
-    def _refresh_token(self):
+    async def _refresh_token(self):
         session = self.session.priority
-        plugin = self.get_plugin(session)
+        plugin = await self.get_plugin(session)
         config = hoordu.Dynamic.from_json(plugin.config)
         
         try:
-            tokens = self.oauth.refresh_access_token(config.refresh_token)
+            self.log.info('attempting to refresh access token')
+            tokens = await self.oauth.refresh_access_token(config.refresh_token)
             
         except OAuthError as e:
-            msg = hoordu.Dynamic.from_json(str(e))
-            if msg.error == 'invalid_grant':
-                self.session.rollback()
-                
-                # refresh token expired or revoked
-                config.pop('access_token')
-                config.pop('refresh_token')
-                plugin.config = config.to_json()
-                session.add(plugin)
-                session.commit()
+            self.log.warning('refresh token was invalid')
+            #msg = hoordu.Dynamic.from_json(str(e))
+            await self.session.rollback()
+            
+            # refresh token expired or revoked
+            config.pop('access_token')
+            config.pop('refresh_token')
+            plugin.config = config.to_json()
+            session.add(plugin)
+            await session.commit()
             
             raise
         
         access_token = tokens['access_token']
+        refresh_token = tokens.get('refresh_token')
+        
         self.config.access_token = access_token
+        config.access_token = access_token
+        
+        if refresh_token is not None:
+            self.config.refresh_token = refresh_token
+            config.refresh_token = refresh_token
         
         # update access_token in the database
-        config.access_token = access_token
         plugin.config = config.to_json()
         session.add(plugin)
-        session.commit()
+        await session.commit()
         
         return access_token
     
-    def _ordered_walk(self, node, base_path=''):
-        for n in natsorted(self.api.folder(node.id), key=lambda x: (self.api.is_dir(x), x.name.lower())):
+    async def _ordered_walk(self, node, base_path=''):
+        files = [f async for f in self.api.folder(node.id)]
+        for n in natsorted(files, key=lambda x: (self.api.is_dir(x), x.name.lower())):
             path = base_path + n.name
             if not self.api.is_dir(n):
                 yield path, n
             
             else:
-                yield from self._ordered_walk(n, base_path=path + '/')
+                async for n in self._ordered_walk(n, base_path=path + '/'):
+                    yield n
     
-    def _download_file(self, file):
+    async def _download_file(self, file):
         url = self.api.file_url(file)
         headers = {'Authorization': f'Bearer {self.config.access_token}'}
         
         try:
-            return self.session.download(url, headers=headers, suffix=file.name)[0]
+            path, _ = await self.session.download(url, headers=headers, suffix=file.name)
+            return path
             
         except HTTPError as e:
             if e.status == 401:
-                self.api.access_token = self._refresh_token()
+                self.api.access_token = await self._refresh_token()
                 headers = {'Authorization': f'Bearer {self.config.access_token}'}
                 
-                return self.session.download(url, headers=headers, suffix=file.name)[0]
+                path, _ = await self.session.download(url, headers=headers, suffix=file.name)
+                return path
     
-    def download(self, id=None, remote_post=None, preview=False):
+    async def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             id = remote_post.original_id
         
-        node = self.api.file(id)
+        node = await self.api.file(id)
         
         original_id = node.id
         
@@ -267,58 +287,55 @@ class GDrive(SimplePluginBase):
         else:
             url = FILE_FORMAT.format(file_id=node.id)
         
-        create_time = dateutil.parser.parse(node.createdTime).astimezone(timezone.utc)
+        create_time = dateutil.parser.parse(node.createdTime).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is None:
-            remote_post = self._get_post(original_id)
+            remote_post = await self._get_post(original_id)
         
-        if remote_post is None:
-            remote_post = RemotePost(
-                source=self.source,
-                original_id=original_id,
-                title=node.name,
-                url=url,
-                type=PostType.set,
-                post_time=create_time
-            )
-            
-            self.session.add(remote_post)
-            self.session.flush()
+        remote_post.title = node.name
+        remote_post.url = url
+        remote_post.type = PostType.set
+        remote_post.post_time = create_time
+        self.session.add(remote_post)
         
         self.log.info(f'downloading post: {remote_post.original_id}')
         self.log.info(f'local id: {remote_post.id}')
         
-        current_files = {file.metadata_: file for file in remote_post.files}
+        files = await remote_post.fetch(RemotePost.files)
+        current_files = {file.metadata_: file for file in files}
         
         if not self.api.is_dir(node):
-            if len(remote_post.files) == 0:
+            if len(files) == 0:
                 file = File(remote=remote_post, remote_order=1, filename=node.name)
                 self.session.add(file)
-                self.session.flush()
+                await self.session.flush()
                 
             else:
-                file = remote_post.files[0]
+                file = files[0]
             
             need_orig = not file.present and not preview
             
             if need_orig:
                 self.log.info(f'downloading file: {file.remote_order}')
                 
-                orig = self._download_file(node)
+                orig = await self._download_file(node)
                 
-                self.session.import_file(file, orig=orig, move=True)
+                await self.session.import_file(file, orig=orig, move=True)
             
             return remote_post
         
         else:
-            for (path, n), order in zip(self._ordered_walk(node), itertools.count(1)):
-                id = n.id
+            order = 0
+            async for path, cnode in self._ordered_walk(node):
+                order += 1
+                
+                id = cnode.id
                 file = current_files.get(id)
                 
                 if file is None:
                     file = File(remote=remote_post, remote_order=order, filename=path, metadata_=id)
                     self.session.add(file)
-                    self.session.flush()
+                    await self.session.flush()
                     
                 else:
                     file.filename = path
@@ -330,9 +347,9 @@ class GDrive(SimplePluginBase):
                 if need_orig:
                     self.log.info(f'downloading file: {file.remote_order}')
                     
-                    orig = self._download_file(n)
+                    orig = await self._download_file(cnode)
                     
-                    self.session.import_file(file, orig=orig, move=True)
+                    await self.session.import_file(file, orig=orig, move=True)
             
             return remote_post
 

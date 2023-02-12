@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import re
 from datetime import datetime, timedelta, timezone
 import dateutil.parser
-from tempfile import mkstemp
-import shutil
 from urllib import parse as urlparse
-import itertools
-import functools
-from xml.sax.saxutils import unescape
 
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 
 import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
-
+from hoordu.plugins.helpers import parse_href
 
 POST_FORMAT = 'https://nijie.info/view.php?id={post_id}'
 POST_URL = ['nijie.info/view.php']
@@ -31,16 +25,19 @@ USER_URL = [
     'nijie.info/members_dojin.php',
 ]
 
-class UserIterator(IteratorBase):
+class UserIterator(IteratorBase['Nijie']):
     def __init__(self, plugin, subscription=None, options=None):
         super().__init__(plugin, subscription=subscription, options=options)
         
-        self.http = plugin.http
+        self.http: aiohttp.ClientSession = plugin.http
         
         self.first_id = None
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
         self.state.tail_page = self.state.get('tail_page', 1)
+    
+    def __repr__(self):
+        return 'user:{}'.format(self.options.user_id)
     
     def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
         if direction == FetchDirection.newer:
@@ -51,7 +48,7 @@ class UserIterator(IteratorBase):
         
         super().reconfigure(direction=direction, num_posts=num_posts)
     
-    def _get_page(self, page_id=None):
+    async def _get_page(self, page_id=None):
         # https://nijie.info/members_illust.php?p={page_id (1 indexed)}&id={user_id}
         if page_id is None: page_id = 1
         
@@ -59,19 +56,19 @@ class UserIterator(IteratorBase):
             'p': page_id,
             'id': self.options.user_id,
         }
-        response = self.http.get(USER_ILLUST_URL, params=params)
-        response.raise_for_status()
-        html = BeautifulSoup(response.text, 'html.parser')
+        async with self.http.get(USER_ILLUST_URL, params=params) as response:
+            response.raise_for_status()
+            html = BeautifulSoup(await response.text(), 'html.parser')
         
         post_urls = [e['href'] for e in html.select('#members_dlsite_left .picture a')]
         return [int(urlparse.parse_qs(urlparse.urlparse(url).query)['id'][0]) for url in post_urls]
     
-    def _iterator(self):
+    async def _iterator(self):
         page_id = self.state.tail_page if self.direction == FetchDirection.older else 1
         
         first_iteration = True
         while True:
-            post_ids = self._get_page(page_id)
+            post_ids = await self._get_page(page_id)
             if len(post_ids) == 0:
                 # empty page, stopping
                 return
@@ -89,7 +86,7 @@ class UserIterator(IteratorBase):
                 if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
                     self.first_id = post_id
                 
-                yield self.plugin._to_remote_post(str(post_id), preview=self.subscription is None)
+                yield await self.plugin._to_remote_post(str(post_id), preview=self.subscription is None)
                 
                 if self.direction == FetchDirection.older:
                     self.state.tail_id = post_id
@@ -103,14 +100,14 @@ class UserIterator(IteratorBase):
             
             page_id += 1
     
-    def _generator(self):
-        for post in self._iterator():
+    async def generator(self):
+        async for post in self._iterator():
             yield post
             
             if self.subscription is not None:
-                self.subscription.feed.append(post)
+                await self.subscription.add_post(post)
             
-            self.session.commit()
+            await self.session.commit()
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -120,9 +117,9 @@ class UserIterator(IteratorBase):
             self.subscription.state = self.state.to_json()
             self.session.add(self.subscription)
         
-        self.session.commit()
+        await self.session.commit()
 
-class Pixiv(SimplePluginBase):
+class Nijie(SimplePlugin):
     name = 'nijie'
     version = 1
     iterator = UserIterator
@@ -135,19 +132,18 @@ class Pixiv(SimplePluginBase):
         )
     
     @classmethod
-    def setup(cls, session, parameters=None):
-        plugin = cls.get_plugin(session)
+    async def setup(cls, session, parameters=None):
+        plugin = await cls.get_plugin(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.contains('NIJIEIJIEID', 'nijie_tok'):
-            # try to get the values from the parameters
-            if parameters is not None:
-                config.update(parameters)
-                
-                plugin.config = config.to_json()
-                session.add(plugin)
+        # use values from the parameters if they were passed
+        if parameters is not None:
+            config.update(parameters)
+            
+            plugin.config = config.to_json()
+            session.add(plugin)
         
         if not config.contains('NIJIEIJIEID', 'nijie_tok'):
             # but if they're still None, the api can't be used
@@ -158,8 +154,8 @@ class Pixiv(SimplePluginBase):
             return True, None
     
     @classmethod
-    def update(cls, session):
-        plugin = cls.get_plugin(session)
+    async def update(cls, session):
+        plugin = await cls.get_plugin(session)
         
         if plugin.version < cls.version:
             # update anything if needed
@@ -169,7 +165,7 @@ class Pixiv(SimplePluginBase):
             session.add(plugin)
     
     @classmethod
-    def parse_url(cls, url):
+    async def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -187,78 +183,51 @@ class Pixiv(SimplePluginBase):
         
         return None
     
-    def __init__(self, session):
-        super().__init__(session)
-        
-        self.http = requests.Session()
-        
-        self._headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/100.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        self.cookies = {
-            'NIJIEIJIEID': self.config.NIJIEIJIEID,
-            'nijie_tok': self.config.nijie_tok,
-        }
-        
-        for name, val in self.cookies.items():
-            cookie = requests.cookies.create_cookie(name=name, value=val)
-            self.http.cookies.set_cookie(cookie)
+    @contextlib.asynccontextmanager
+    async def context(self):
+        async with super().context():
+            self._headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/100.0'
+            }
+            self.cookies = {
+                'NIJIEIJIEID': self.config.NIJIEIJIEID,
+                'nijie_tok': self.config.nijie_tok,
+            }
+            
+            async with aiohttp.ClientSession(headers=self._headers, cookies=self.cookies) as http:
+                self.http: aiohttp.ClientSession = http
+                yield self
     
-    def _download_file(self, url):
-        path, resp = self.session.download(url, cookies=self.cookies)
+    async def _download_file(self, url):
+        path, resp = await self.session.download(url, cookies=self.cookies)
         return path
     
-    def _parse_href(self, page_url, href):
-        if re.match('^https?:\/\/\S+$', href):
-            return href
-        
-        if href.startswith('//'):
-            base_url = re.match('^[^:]+:', page_url).group(0)
-            return base_url + href
-            
-        elif href.startswith('/'):
-            base_url = re.match('^[^:]+:\/\/[^\/]+', page_url).group(0)
-            return base_url + href
-        
-        else:
-            base_url = re.match('^.*/', page_url).group(0)
-            return base_url + href
-        
-    
-    def _to_remote_post(self, id, remote_post=None, preview=False):
+    async def _to_remote_post(self, id, remote_post=None, preview=False):
         url = POST_FORMAT.format(post_id=id)
         
-        response = self.http.get(url)
-        response.raise_for_status()
-        post = BeautifulSoup(response.text, 'html.parser')
+        async with self.http.get(url) as response:
+            response.raise_for_status()
+            post = BeautifulSoup(await response.text(), 'html.parser')
         
+        # if there is no title, chances are the cookie doesn't work
+        # TODO need a way to detect if the cookie works or not, no error code is returned
         title = post.select('.illust_title')[0].text
         
-        imgs = post.select("#gallery img.mozamoza")
-        user_id = imgs[0]['user_id']
+        files = post.select("#gallery .mozamoza")
+        user_id = files[0]['user_id']
         
         user_name = list(post.select("#pro .name")[0].children)[2]
         
         timestamp = post.select("#view-honbun span")[0].text.split('：', 1)[-1]
-        post_time = dateutil.parser.parse(timestamp).astimezone(timezone.utc)
+        post_time = dateutil.parser.parse(timestamp).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is None:
-            remote_post = self._get_post(id)
+            remote_post = await self._get_post(id)
         
-        if remote_post is None:
-            remote_post = RemotePost(
-                source=self.source,
-                original_id=id,
-                url=url,
-                title=title,
-                type=PostType.set,
-                post_time=post_time
-            )
-            
-            self.session.add(remote_post)
-            self.session.flush()
+        remote_post.url = url
+        remote_post.title = title
+        remote_post.type = PostType.set
+        remote_post.post_time = post_time
         
         self.log.info(f'downloading post: {remote_post.original_id}')
         self.log.info(f'local id: {remote_post.id}')
@@ -269,7 +238,7 @@ class Pixiv(SimplePluginBase):
         urls = []
         page_url = POST_FORMAT.format(post_id=id)
         for a in comment_html.select('a'):
-            url = self._parse_href(page_url, a['href'])
+            url = parse_href(page_url, a['href'])
             urls.append(url)
             
             a.replace_with(url)
@@ -281,34 +250,36 @@ class Pixiv(SimplePluginBase):
             para.replace_with(para.text + '\n')
         
         remote_post.comment = comment_html.text
+        self.session.add(remote_post)
         
-        user_tag = self._get_tag(TagCategory.artist, user_id)
-        remote_post.add_tag(user_tag)
+        
+        user_tag = await self._get_tag(TagCategory.artist, user_id)
+        await remote_post.add_tag(user_tag)
         
         if user_tag.update_metadata('name', user_name):
             self.session.add(user_tag)
         
         tags = post.select('#view-tag li.tag a')
         for tag in tags:
-            remote_tag = self._get_tag(TagCategory.general, tag.text)
-            remote_post.add_tag(remote_tag)
+            remote_tag = await self._get_tag(TagCategory.general, tag.text)
+            await remote_post.add_tag(remote_tag)
         
         for url in urls:
-            remote_post.add_related_url(url)
+            await remote_post.add_related_url(url)
         
         # files
-        available = set(range(len(imgs)))
-        present = set(file.remote_order for file in remote_post.files)
+        available = set(range(len(files)))
+        present = set(file.remote_order for file in await remote_post.fetch(RemotePost.files))
         
         for order in available - present:
             file = File(remote=remote_post, remote_order=order)
             self.session.add(file)
-            self.session.flush()
+            await self.session.flush()
         
-        for file in remote_post.files:
-            img = imgs[file.remote_order]
+        for file in await remote_post.fetch(RemotePost.files):
+            f = files[file.remote_order]
             
-            orig_url = 'https:' + img['src'].replace('__rs_l120x120/', '')
+            orig_url = parse_href(page_url, f['src'].replace('__rs_l120x120/', ''))
             thumb_url = orig_url.replace('/nijie/', '/__rs_l120x120/nijie/')
             
             need_orig = not file.present and not preview
@@ -317,31 +288,31 @@ class Pixiv(SimplePluginBase):
             if need_thumb or need_orig:
                 self.log.info(f'downloading file: {file.remote_order}')
                 
-                orig = self._download_file(orig_url) if need_orig else None
-                thumb = self._download_file(thumb_url) if need_thumb else None
+                orig = await self._download_file(orig_url) if need_orig else None
+                thumb = await self._download_file(thumb_url) if need_thumb else None
                 
-                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         return remote_post
     
-    def download(self, id=None, remote_post=None, preview=False):
+    async def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             id = remote_post.original_id
         
-        return self._to_remote_post(id, remote_post=remote_post, preview=preview)
+        return await self._to_remote_post(id, remote_post=remote_post, preview=preview)
     
     def search_form(self):
         return Form('{} search'.format(self.name),
             ('user_id', Input('user id', [validators.required()]))
         )
     
-    def get_search_details(self, options):
-        response = self.http.get(USER_INFO_URL, params={'id': options.user_id})
-        response.raise_for_status()
-        html = BeautifulSoup(response.text, 'html.parser')
+    async def get_search_details(self, options):
+        async with self.http.get(USER_INFO_URL, params={'id': options.user_id}) as response:
+            response.raise_for_status()
+            html = BeautifulSoup(await response.text(), 'html.parser')
         
         user_name = list(html.select("#pro .name")[0].children)[2]
         thumbnail_url = html.select("#pro img")[0]['src'].replace("__rs_cs150x150/", "")
@@ -349,11 +320,11 @@ class Pixiv(SimplePluginBase):
         
         desc_html = html.select('#prof-l')[0]
         
-        urls = []
+        urls = set()
         page_url = POST_FORMAT.format(post_id=id)
         for a in desc_html.select('a'):
             url = a.text
-            urls.append(url)
+            urls.add(url)
             
             a.replace_with(url)
         
@@ -364,16 +335,13 @@ class Pixiv(SimplePluginBase):
             dd.replace_with(dd.text + '\n')
         
         return SearchDetails(
-            hint=user_name,
-            title=user_name,
+            hint=user_name.text,
+            title=user_name.text,
             description=desc_html.text,
             thumbnail_url=thumbnail_url,
             related_urls=urls
         )
     
-    def subscription_repr(self, options):
-        return 'user:{}'.format(options.user_id)
-    
-Plugin = Pixiv
+Plugin = Nijie
 
 

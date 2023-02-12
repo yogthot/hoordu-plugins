@@ -9,7 +9,8 @@ import shutil
 from urllib.parse import urlparse
 import functools
 
-import requests
+import aiohttp
+import contextlib
 from bs4 import BeautifulSoup
 
 import hoordu
@@ -27,14 +28,17 @@ FANCLUB_URL = 'https://fantia.jp/fanclubs/{fanclub_id}'
 FANCLUB_GET_URL = 'https://fantia.jp/api/v1/fanclubs/{fanclub_id}'
 FILE_DOWNLOAD_URL = 'https://fantia.jp{download_uri}'
 
-class CreatorIterator(IteratorBase):
+class CreatorIterator(IteratorBase['Fantia']):
     def __init__(self, fantia, subscription=None, options=None):
         super().__init__(fantia, subscription=subscription, options=options)
         
-        self.http = fantia.http
+        self.http: aiohttp.ClientSession = fantia.http
         
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
+    
+    def __repr__(self):
+        return 'posts:{}'.format(self.options.creator_id)
     
     def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
         if self.state.tail_id is None:
@@ -42,10 +46,10 @@ class CreatorIterator(IteratorBase):
         
         super().reconfigure(direction=direction, num_posts=num_posts)
     
-    def _recover_head(self):
-        response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id))
-        response.raise_for_status()
-        fanclub = hoordu.Dynamic.from_json(response.text).fanclub
+    async def _recover_head(self):
+        async with self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id)) as response:
+            response.raise_for_status()
+            fanclub = hoordu.Dynamic.from_json(await response.text()).fanclub
         
         if not fanclub.recent_posts:
             return
@@ -54,9 +58,10 @@ class CreatorIterator(IteratorBase):
         head_id = post_id
         
         while post_id > self.state.head_id:
-            response = self.http.get(POST_GET_URL.format(post_id=post_id))
-            response.raise_for_status()
-            post = hoordu.Dynamic.from_json(response.text).post
+            csrf = await self.plugin._get_csrf_token(post_id)
+            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
+                response.raise_for_status()
+                post = hoordu.Dynamic.from_json(await response.text()).post
             
             yield post
             
@@ -69,13 +74,13 @@ class CreatorIterator(IteratorBase):
         
         self.state.head_id = head_id
     
-    def _post_iterator(self):
+    async def _post_iterator(self):
         post_id = self.state.head_id if self.direction == FetchDirection.newer else self.state.tail_id
         
         if post_id is None:
-            response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id))
-            response.raise_for_status()
-            fanclub = hoordu.Dynamic.from_json(response.text).fanclub
+            async with self.http.get(FANCLUB_GET_URL.format(fanclub_id=self.options.creator_id)) as response:
+                response.raise_for_status()
+                fanclub = hoordu.Dynamic.from_json(await response.text()).fanclub
             
             if not fanclub.recent_posts:
                 return
@@ -85,12 +90,15 @@ class CreatorIterator(IteratorBase):
             self.state.tail_id = post_id
             
         else:
-            response = self.http.get(POST_GET_URL.format(post_id=post_id))
-            was_deleted = (response.status_code == 404)
-            if not was_deleted:
-                response.raise_for_status()
-                post = hoordu.Dynamic.from_json(response.text).post
+            post = None
+            csrf = await self.plugin._get_csrf_token(post_id)
+            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
+                was_deleted = (response.status == 404)
+                if not was_deleted:
+                    response.raise_for_status()
+                    post = hoordu.Dynamic.from_json(await response.text()).post
                 
+            if not was_deleted:
                 next_post = post.links.next if self.direction == FetchDirection.newer else post.links.previous
                 if next_post is None:
                     return
@@ -98,7 +106,8 @@ class CreatorIterator(IteratorBase):
                 post_id = next_post.id
                 
             elif self.direction == FetchDirection.newer:
-                yield from self._recover_head()
+                async for post in self._recover_head():
+                    yield post
                 return
                 
             else:
@@ -107,9 +116,10 @@ class CreatorIterator(IteratorBase):
         # iter(int, 1) -> infinite iterator
         it = range(self.num_posts) if self.num_posts is not None else iter(int, 1)
         for _ in it:
-            response = self.http.get(POST_GET_URL.format(post_id=post_id))
-            response.raise_for_status()
-            post = hoordu.Dynamic.from_json(response.text).post
+            csrf = await self.plugin._get_csrf_token(post_id)
+            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
+                response.raise_for_status()
+                post = hoordu.Dynamic.from_json(await response.text()).post
             
             yield post
             
@@ -124,25 +134,25 @@ class CreatorIterator(IteratorBase):
             
             post_id = next_post.id
     
-    def _generator(self):
-        for post in self._post_iterator():
-            remote_posts = self.plugin._to_remote_posts(post, preview=self.subscription is None)
+    async def generator(self):
+        async for post in self._post_iterator():
+            remote_posts = await self.plugin._to_remote_posts(post, preview=self.subscription is None)
             for remote_post in remote_posts:
                 yield remote_post
             
             if self.subscription is not None:
                 for p in remote_posts:
-                    self.subscription.feed.append(p)
+                    await self.subscription.add_post(p)
             
-            self.session.commit()
+            await self.session.commit()
         
         if self.subscription is not None:
             self.subscription.state = self.state.to_json()
             self.session.add(self.subscription)
         
-        self.session.commit()
+        await self.session.commit()
 
-class Fantia(SimplePluginBase):
+class Fantia(SimplePlugin):
     name = 'fantia'
     version = 1
     iterator = CreatorIterator
@@ -154,19 +164,18 @@ class Fantia(SimplePluginBase):
         )
     
     @classmethod
-    def setup(cls, session, parameters=None):
-        plugin = cls.get_plugin(session)
+    async def setup(cls, session, parameters=None):
+        plugin = await cls.get_plugin(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.contains('session_id'):
-            # try to get the values from the parameters
-            if parameters is not None:
-                config.update(parameters)
-                
-                plugin.config = config.to_json()
-                session.add(plugin)
+        # use values from the parameters if they were passed
+        if parameters is not None:
+            config.update(parameters)
+            
+            plugin.config = config.to_json()
+            session.add(plugin)
         
         if not config.contains('session_id'):
             # but if they're still None, the api can't be used
@@ -177,8 +186,8 @@ class Fantia(SimplePluginBase):
             return True, None
     
     @classmethod
-    def update(cls, session):
-        plugin = cls.get_plugin(session)
+    async def update(cls, session):
+        plugin = await cls.get_plugin(session)
         
         if plugin.version < cls.version:
             # update anything if needed
@@ -188,7 +197,7 @@ class Fantia(SimplePluginBase):
             session.add(plugin)
     
     @classmethod
-    def parse_url(cls, url):
+    async def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -204,87 +213,87 @@ class Fantia(SimplePluginBase):
         
         return None
     
-    def __init__(self, session):
-        super().__init__(session)
-        
-        self.http = requests.Session()
-        
-        self._headers = {
-            'Origin': 'https://fantia.jp/',
-            'Referer': 'https://fantia.jp/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        cookie = requests.cookies.create_cookie(name='_session_id', value=self.config.session_id)
-        self.http.cookies.set_cookie(cookie)
+    @contextlib.asynccontextmanager
+    async def context(self):
+        async with super().context():
+            self._headers = {
+                'Origin': 'https://fantia.jp/',
+                'Referer': 'https://fantia.jp/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+            }
+            self._cookies = {
+                '_session_id': self.config.session_id
+            }
+            
+            async with aiohttp.ClientSession(headers=self._headers, cookies=self._cookies) as http:
+                self.http: aiohttp.ClientSession = http
+                yield self
     
-    def _download_file(self, url, filename=None):
-        cookies = {
-            '_session_id': self.config.session_id
-        }
-        path, resp = self.session.download(url, headers=self._headers, cookies=cookies, suffix=filename)
+    async def _get_csrf_token(self, post_id):
+        async with self.http.get(POST_FORMAT.format(post_id=post_id)) as response:
+            response.raise_for_status()
+            html = BeautifulSoup(await response.text(), 'html.parser')
+            meta_tag = html.select('meta[name="csrf-token"]')[0]
+            return meta_tag['content']
+    
+    async def _download_file(self, url, filename=None):
+        path, resp = await self.session.download(url, headers=self._headers, cookies=self._cookies, suffix=filename)
         return path
     
-    def _content_to_post(self, post, content, remote_post=None, preview=False):
+    async def _content_to_post(self, post, content, remote_post=None, preview=False):
         content_id = '{post_id}-{content_id}'.format(post_id=post.id, content_id=content.id)
         creator_id = str(post.fanclub.id)
         creator_name = post.fanclub.user.name
         # possible timezone issues?
-        post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc)
+        post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is None:
-            remote_post = self._get_post(content_id)
+            remote_post = await self._get_post(content_id)
         
-        if remote_post is None:
-            metadata = hoordu.Dynamic()
-            if content.plan is not None:
-                metadata.price = content.plan.price
-            
-            remote_post = RemotePost(
-                source=self.source,
-                original_id=content_id,
-                url=POST_FORMAT.format(post_id=post.id),
-                title=content.title,
-                comment=content.comment,
-                type=PostType.collection,
-                post_time=post_time,
-                metadata_=metadata.to_json()
-            )
-            
-            self.session.add(remote_post)
-            self.session.flush()
+        metadata = hoordu.Dynamic()
+        if content.plan is not None:
+            metadata.price = content.plan.price
         
-        self.log.info(f'downloading post: {remote_post.original_id}')
-        self.log.info(f'local id: {remote_post.id}')
+        remote_post.url = POST_FORMAT.format(post_id=post.id)
+        remote_post.title = content.title
+        remote_post.comment = content.comment
+        remote_post.type = PostType.collection
+        remote_post.post_time = post_time
+        remote_post.metadata_ = metadata.to_json()
         
         if post.liked is True:
             remote_post.favorite = True
         
+        self.session.add(remote_post)
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
         # creators are identified by their id because their name can change
-        creator_tag = self._get_tag(TagCategory.artist, creator_id)
-        remote_post.add_tag(creator_tag)
+        creator_tag = await self._get_tag(TagCategory.artist, creator_id)
+        await remote_post.add_tag(creator_tag)
         
         if creator_tag.update_metadata('name', creator_name):
             self.session.add(creator_tag)
         
         for tag in post.tags:
-            remote_tag = self._get_tag(TagCategory.general, tag.name)
-            remote_post.add_tag(remote_tag)
+            remote_tag = await self._get_tag(TagCategory.general, tag.name)
+            await remote_post.add_tag(remote_tag)
         
         if post.rating == 'adult':
-            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-            remote_post.add_tag(nsfw_tag)
+            nsfw_tag = await self._get_tag(TagCategory.meta, 'nsfw')
+            await remote_post.add_tag(nsfw_tag)
         
+        files = await remote_post.fetch(RemotePost.files)
         if content.category == 'file':
-            if len(remote_post.files) == 0:
+            if len(files) == 0:
                 file = File(remote=remote_post, remote_order=0, filename=content.filename)
                 
                 self.session.add(file)
-                self.session.flush()
+                await self.session.flush()
                 
             else:
-                file = remote_post.files[0]
+                file = files[0]
             
             need_orig = not file.present and not preview
             
@@ -292,12 +301,12 @@ class Fantia(SimplePluginBase):
                 self.log.info(f'downloading file: {content.filename}')
                 
                 orig_url = FILE_DOWNLOAD_URL.format(download_uri=content.download_uri)
-                orig = self._download_file(orig_url, filename=content.filename)
+                orig = await self._download_file(orig_url, filename=content.filename)
                 
-                self.session.import_file(file, orig=orig, move=True)
+                await self.session.import_file(file, orig=orig, move=True)
             
         elif content.category == 'photo_gallery':
-            current_files = {file.metadata_: file for file in remote_post.files}
+            current_files = {file.metadata_: file for file in files}
             
             order = 0
             for photo in content.post_content_photos:
@@ -307,7 +316,7 @@ class Fantia(SimplePluginBase):
                 if file is None:
                     file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                     self.session.add(file)
-                    self.session.flush()
+                    await self.session.flush()
                     
                 elif file.remote_order != order:
                     file.remote_order = order
@@ -319,10 +328,10 @@ class Fantia(SimplePluginBase):
                 if need_thumb or need_orig:
                     self.log.info(f'downloading file: {file.remote_order}')
                     
-                    orig = self._download_file(photo.url.original) if need_orig else None
-                    thumb = self._download_file(photo.url.medium) if need_thumb else None
+                    orig = await self._download_file(photo.url.original) if need_orig else None
+                    thumb = await self._download_file(photo.url.medium) if need_thumb else None
                     
-                    self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                    await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                 
                 order += 1
             
@@ -332,7 +341,7 @@ class Fantia(SimplePluginBase):
             self.session.add(remote_post)
             
         elif content.category == 'blog':
-            current_files = {file.remote_order: file for file in remote_post.files}
+            current_files = {file.remote_order: file for file in files}
             
             sections = hoordu.Dynamic.from_json(content.comment).ops
             blog = []
@@ -347,6 +356,7 @@ class Fantia(SimplePluginBase):
                     
                 elif isinstance(insert, hoordu.Dynamic):
                     fantiaImage = insert.get('fantiaImage')
+                    image = insert.get('image')
                     if fantiaImage is not None:
                         photo_id = str(fantiaImage.id)
                         file = current_files.get(photo_id)
@@ -354,8 +364,9 @@ class Fantia(SimplePluginBase):
                         if file is None:
                             file = File(remote=remote_post, metadata_=photo_id, remote_order=order)
                             self.session.add(file)
-                            self.session.flush()
+                            await self.session.flush()
                         
+                        # should use parse_url here (function from other plugins)
                         orig_url = FILE_DOWNLOAD_URL.format(download_uri=fantiaImage.original_url)
                         thumb_url = fantiaImage.url
                         
@@ -365,14 +376,39 @@ class Fantia(SimplePluginBase):
                         if need_thumb or need_orig:
                             self.log.info(f'downloading file: {file.remote_order}')
                             
-                            orig = self._download_file(orig_url) if need_orig else None
-                            thumb = self._download_file(thumb_url) if need_thumb else None
+                            orig = await self._download_file(orig_url) if need_orig else None
+                            thumb = await self._download_file(thumb_url) if need_thumb else None
                             
-                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                            await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         
                         blog.append({
                             'type': 'file',
                             'metadata': photo_id
+                        })
+                        
+                        order += 1
+                        
+                    elif image is not None:
+                        image_id = '0:' + re.split('[\/.]', image)[-2]
+                        file = current_files.get(image_id)
+                        
+                        if file is None:
+                            file = File(remote=remote_post, metadata_=image_id, remote_order=order)
+                            self.session.add(file)
+                            await self.session.flush()
+                        
+                        need_orig = not file.present and not preview
+                        
+                        if need_orig:
+                            self.log.info(f'downloading file: {file.remote_order}')
+                            
+                            orig = await self._download_file(image) if need_orig else None
+                            
+                            await self.session.import_file(file, orig=orig, move=True)
+                        
+                        blog.append({
+                            'type': 'file',
+                            'metadata': image_id
                         })
                         
                         order += 1
@@ -389,12 +425,12 @@ class Fantia(SimplePluginBase):
         
         return remote_post
     
-    def _to_remote_posts(self, post, remote_post=None, preview=False):
+    async def _to_remote_posts(self, post, remote_post=None, preview=False):
         main_id = str(post.id)
         creator_id = str(post.fanclub.id)
         creator_name = post.fanclub.user.name
         # possible timezone issues?
-        post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc)
+        post_time = dateutil.parser.parse(post.posted_at).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is not None:
             id_parts = remote_post.id.split('-')
@@ -409,53 +445,48 @@ class Fantia(SimplePluginBase):
                     return [remote_post]
         
         if remote_post is None:
-            remote_post = self._get_post(main_id)
+            remote_post = await self._get_post(main_id)
         
-        if remote_post is None:
-            remote_post = RemotePost(
-                source=self.source,
-                original_id=main_id,
-                url=POST_FORMAT.format(post_id=main_id),
-                title=post.title,
-                comment=post.comment,
-                type=PostType.collection,
-                post_time=post_time
-            )
-            
-            self.session.add(remote_post)
-            self.session.flush()
-        
-        self.log.info(f'downloading post: {remote_post.original_id}')
-        self.log.info(f'local id: {remote_post.id}')
+        remote_post.url = POST_FORMAT.format(post_id=main_id)
+        remote_post.title = post.title
+        remote_post.comment = post.comment
+        remote_post.type = PostType.collection
+        remote_post.post_time = post_time
         
         if post.liked is True:
             remote_post.favorite = True
         
+        self.session.add(remote_post)
+        
+        self.log.info(f'downloading post: {remote_post.original_id}')
+        self.log.info(f'local id: {remote_post.id}')
+        
         # creators are identified by their id because their name can change
-        creator_tag = self._get_tag(TagCategory.artist, creator_id)
-        remote_post.add_tag(creator_tag)
+        creator_tag = await self._get_tag(TagCategory.artist, creator_id)
+        await remote_post.add_tag(creator_tag)
         
         if creator_tag.update_metadata('name', creator_name):
             self.session.add(creator_tag)
         
         for tag in post.tags:
-            remote_tag = self._get_tag(TagCategory.general, tag.name)
-            remote_post.add_tag(remote_tag)
+            remote_tag = await self._get_tag(TagCategory.general, tag.name)
+            await remote_post.add_tag(remote_tag)
         
         if post.rating == 'adult':
-            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-            remote_post.add_tag(nsfw_tag)
+            nsfw_tag = await self._get_tag(TagCategory.meta, 'nsfw')
+            await remote_post.add_tag(nsfw_tag)
         
         # download thumbnail if there is one
-        if len(remote_post.files) == 0:
+        files = await remote_post.fetch(RemotePost.files)
+        if len(files) == 0:
             if post.thumb is not None:
                 file = File(remote=remote_post, remote_order=0)
                 self.session.add(file)
-                self.session.flush()
+                await self.session.flush()
             else:
                 file = None
         else:
-            file = remote_post.files[0]
+            file = files[0]
         
         if file is not None:
             need_orig = not file.present and not preview
@@ -463,41 +494,39 @@ class Fantia(SimplePluginBase):
             if need_orig or need_thumb:
                 self.log.info(f'downloading file: {file.remote_order}')
                 
-                orig = self._download_file(post.thumb.original) if need_orig else None
-                thumb = self._download_file(post.thumb.medium) if need_thumb else None
+                orig = await self._download_file(post.thumb.original) if need_orig else None
+                thumb = await self._download_file(post.thumb.medium) if need_thumb else None
                 
-                self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         # convert the post contents to posts as well
         remote_posts = [remote_post]
         for content in post.post_contents:
             if content.visible_status == 'visible':
-                content_post = self._content_to_post(post, content, preview=preview)
+                content_post = await self._content_to_post(post, content, preview=preview)
                 remote_posts.append(content_post)
-                self.session.flush()
-                rel = self.session.query(Related) \
-                        .filter(
-                            Related.related_to_id == remote_post.id,
-                            Related.remote_id == content_post.id
-                        ).one_or_none()
                 
-                if rel is None:
-                    remote_post.related.append(Related(remote=content_post))
+                related = await remote_post.fetch(RemotePost.related)
+                if not any(r.remote_id == content_post.id for r in related):
+                    self.session.add(Related(related_to=remote_post, remote=content_post))
+                
+                await self.session.flush()
         
         return remote_posts
     
-    def download(self, id=None, remote_post=None, preview=False):
+    async def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             id = remote_post.original_id.split('-')[0]
         
-        response = self.http.get(POST_GET_URL.format(post_id=id))
-        response.raise_for_status()
-        post = hoordu.Dynamic.from_json(response.text).post
+        csrf = await self._get_csrf_token(id)
+        async with self.http.get(POST_GET_URL.format(post_id=id), headers={'X-CSRF-Token': csrf}) as response:
+            response.raise_for_status()
+            post = hoordu.Dynamic.from_json(await response.text()).post
         
-        remote_posts = self._to_remote_posts(post, remote_post=remote_post, preview=preview)
+        remote_posts = await self._to_remote_posts(post, remote_post=remote_post, preview=preview)
         if remote_posts is not None and len(remote_posts) > 0:
             return remote_posts[0]
         else:
@@ -508,16 +537,16 @@ class Fantia(SimplePluginBase):
             ('creator_id', Input('fanclub id', [validators.required()]))
         )
     
-    def get_search_details(self, options):
-        html_response = self.http.get(FANCLUB_URL.format(fanclub_id=options.creator_id))
-        html_response.raise_for_status()
-        html = BeautifulSoup(html_response.text, 'html.parser')
+    async def get_search_details(self, options):
+        async with self.http.get(FANCLUB_URL.format(fanclub_id=options.creator_id)) as html_response:
+            html_response.raise_for_status()
+            html = BeautifulSoup(await html_response.text(), 'html.parser')
         
-        response = self.http.get(FANCLUB_GET_URL.format(fanclub_id=options.creator_id))
-        response.raise_for_status()
-        fanclub = hoordu.Dynamic.from_json(response.text).fanclub
+        async with self.http.get(FANCLUB_GET_URL.format(fanclub_id=options.creator_id)) as response:
+            response.raise_for_status()
+            fanclub = hoordu.Dynamic.from_json(await response.text()).fanclub
         
-        related_urls = [x['href'] for x in html.select('main .btns:not(.share-btns) a')]
+        related_urls = {x['href'] for x in html.select('main .btns:not(.share-btns) a')}
         
         return SearchDetails(
             hint=fanclub.user.name,
@@ -526,9 +555,6 @@ class Fantia(SimplePluginBase):
             thumbnail_url=fanclub.icon.main,
             related_urls=related_urls
         )
-    
-    def subscription_repr(self, options):
-        return 'posts:{}'.format(options.creator_id)
 
 Plugin = Fantia
 

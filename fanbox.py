@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 
-import os
 import re
 from datetime import datetime, timedelta, timezone
 import dateutil.parser
-from tempfile import mkstemp
-import shutil
-from urllib.parse import urlparse, parse_qs
 import itertools
-import functools
 
-import requests
+import aiohttp
+from bs4 import BeautifulSoup
 
 import hoordu
 from hoordu.models import *
@@ -33,14 +29,15 @@ CREATOR_REGEXP = [
 ]
 
 POST_GET_URL = 'https://api.fanbox.cc/post.info?postId={post_id}'
+POST_EMBED_INFO_URL = 'https://api.fanbox.cc/post.get?postId={related_post_id}'
 CREATOR_POSTS_URL = 'https://api.fanbox.cc/post.listCreator'
 PAGE_LIMIT = 10
 
-class CreatorIterator(IteratorBase):
+class CreatorIterator(IteratorBase['Fanbox']):
     def __init__(self, fanbox, subscription=None, options=None):
         super().__init__(fanbox, subscription=subscription, options=options)
         
-        self.http = fanbox.http
+        self.http: aiohttp.ClientSession = fanbox.http
         
         self.options.pixiv_id = self.options.get('pixiv_id')
         
@@ -49,26 +46,29 @@ class CreatorIterator(IteratorBase):
         self.state.tail_id = self.state.get('tail_id')
         self.state.tail_datetime = self.state.get('tail_datetime')
     
-    def init(self):
+    def __repr__(self):
+        return 'posts:{}'.format(self.options.pixiv_id)
+    
+    async def init(self):
         update = False
         
         if self.options.pixiv_id is not None:
-            creator = self.plugin._get_creator_id(self.options.pixiv_id)
+            creator = await self.plugin._get_creator_id(self.options.pixiv_id)
             
             if creator and self.options.creator != creator:
                 self.options.creator = self.options.creator = creator
                 update = True
             
         else:
-            response = self.http.get(CREATOR_GET_URL.format(creator=self.options.creator))
-            response.raise_for_status()
-            creator = hoordu.Dynamic.from_json(response.text).body
+            async with self.http.get(CREATOR_GET_URL.format(creator=self.options.creator)) as response:
+                response.raise_for_status()
+                creator = hoordu.Dynamic.from_json(await response.text()).body
             
             self.options.pixiv_id = creator.user.userId
             update = True
         
         if update and self.subscription is not None:
-            self.subscription.repr = self.plugin.subscription_repr(self.options)
+            self.subscription.repr = repr(self)
             self.subscription.options = self.options.to_json()
             self.session.add(self.subscription)
     
@@ -81,7 +81,7 @@ class CreatorIterator(IteratorBase):
         
         super().reconfigure(direction=direction, num_posts=num_posts)
     
-    def _post_iterator(self):
+    async def _post_iterator(self):
         head = (self.direction == FetchDirection.newer)
         
         min_id = int(self.state.head_id) if head and self.state.head_id is not None else None
@@ -91,7 +91,9 @@ class CreatorIterator(IteratorBase):
         total = 0
         first_iteration = True
         while True:
-            page_size = PAGE_LIMIT if self.num_posts is None else min(self.num_posts - total, PAGE_LIMIT)
+            page_size = PAGE_LIMIT
+            if self.num_posts is not None:
+                page_size = min(self.num_posts - total, PAGE_LIMIT)
             
             params = {
                 'creatorId': self.options.creator,
@@ -105,10 +107,10 @@ class CreatorIterator(IteratorBase):
                 d = dateutil.parser.parse(max_datetime).replace(tzinfo=None)
                 params['maxPublishedDatetime'] = (d - timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
             
-            response = self.http.get(CREATOR_POSTS_URL, params=params)
-            response.raise_for_status()
-            body = hoordu.Dynamic.from_json(response.text).body
-            posts = body['items']
+            async with self.http.get(CREATOR_POSTS_URL, params=params) as response:
+                response.raise_for_status()
+                body = hoordu.Dynamic.from_json(await response.text()).body
+                posts = body['items']
             
             if len(posts) == 0:
                 return
@@ -139,20 +141,19 @@ class CreatorIterator(IteratorBase):
             
             first_iteration = False
     
-    def _generator(self):
-        for post in self._post_iterator():
+    async def generator(self):
+        async for post in self._post_iterator():
+            async with self.http.get(POST_GET_URL.format(post_id=post.id)) as response:
+                response.raise_for_status()
+                post_body = hoordu.Dynamic.from_json(await response.text()).body
             
-            response = self.http.get(POST_GET_URL.format(post_id=post.id))
-            response.raise_for_status()
-            post_body = hoordu.Dynamic.from_json(response.text).body
-            
-            remote_post = self.plugin._to_remote_post(post_body, preview=self.subscription is None)
+            remote_post = await self.plugin._to_remote_post(post_body, preview=self.subscription is None)
             yield remote_post
             
             if self.subscription is not None:
-                self.subscription.feed.append(remote_post)
+                await self.subscription.add_post(remote_post)
             
-            self.session.commit()
+            await self.session.commit()
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -162,9 +163,9 @@ class CreatorIterator(IteratorBase):
             self.subscription.state = self.state.to_json()
             self.session.add(self.subscription)
         
-        self.session.commit()
+        await self.session.commit()
 
-class Fanbox(SimplePluginBase):
+class Fanbox(SimplePlugin):
     name = 'fanbox'
     version = 1
     iterator = CreatorIterator
@@ -176,19 +177,18 @@ class Fanbox(SimplePluginBase):
         )
     
     @classmethod
-    def setup(cls, session, parameters=None):
-        plugin = cls.get_plugin(session)
+    async def setup(cls, session, parameters=None):
+        plugin = await cls.get_plugin(session)
         
         # check if everything is ready to use
         config = hoordu.Dynamic.from_json(plugin.config)
         
-        if not config.contains('FANBOXSESSID'):
-            # try to get the values from the parameters
-            if parameters is not None:
-                config.update(parameters)
-                
-                plugin.config = config.to_json()
-                session.add(plugin)
+        # use values from the parameters if they were passed
+        if parameters is not None:
+            config.update(parameters)
+            
+            plugin.config = config.to_json()
+            session.add(plugin)
         
         if not config.contains('FANBOXSESSID'):
             # but if they're still None, the api can't be used
@@ -199,8 +199,8 @@ class Fanbox(SimplePluginBase):
             return True, None
     
     @classmethod
-    def update(cls, session):
-        plugin = cls.get_plugin(session)
+    async def update(cls, session):
+        plugin = await cls.get_plugin(session)
         
         if plugin.version < cls.version:
             # update anything if needed
@@ -210,7 +210,7 @@ class Fanbox(SimplePluginBase):
             session.add(plugin)
     
     @classmethod
-    def parse_url(cls, url):
+    async def parse_url(cls, url):
         if url.isdigit():
             return url
         
@@ -228,63 +228,54 @@ class Fanbox(SimplePluginBase):
         
         return None
     
-    def __init__(self, session):
-        super().__init__(session)
-        
-        self.http = requests.Session()
-        
-        self._headers = {
-            'Origin': 'https://www.fanbox.cc',
-            'Referer': 'https://www.fanbox.cc/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
-        }
-        self.http.headers.update(self._headers)
-        
-        cookie = requests.cookies.create_cookie(name='FANBOXSESSID', value=self.config.FANBOXSESSID)
-        self.http.cookies.set_cookie(cookie)
+    @contextlib.asynccontextmanager
+    async def context(self):
+        async with super().context():
+            self._headers = {
+                'Origin': 'https://www.fanbox.cc',
+                'Referer': 'https://www.fanbox.cc/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+            }
+            self._cookies = {
+                'FANBOXSESSID': self.config.FANBOXSESSID
+            }
+            
+            async with aiohttp.ClientSession(headers=self._headers, cookies=self._cookies) as http:
+                self.http: aiohttp.ClientSession = http
+                yield self
     
-    def _get_creator_id(self, pixiv_id):
-        response = self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=pixiv_id), allow_redirects=False)
-        creator_url = response.headers['Location']
+    async def _get_creator_id(self, pixiv_id):
+        async with self.http.get(CREATOR_ID_GET_URL.format(pixiv_id=pixiv_id), allow_redirects=False) as response:
+            creator_url = response.headers['Location']
         
         match = CREATOR_URL_REGEXP.match(creator_url)
         return match.group('creator')
     
-    def _download_file(self, url):
-        cookies = {
-            'FANBOXSESSID': self.config.FANBOXSESSID
-        }
-        path, resp = self.session.download(url, headers=self._headers, cookies=cookies)
+    async def _download_file(self, url):
+        path, resp = await self.session.download(url, headers=self._headers, cookies=self._cookies)
         return path
     
-    def _to_remote_post(self, post, remote_post=None, preview=False):
+    async def _to_remote_post(self, post, remote_post=None, preview=False):
         main_id = post.id
         creator_id = post.user.userId
         creator_slug = post.creatorId
         creator_name = post.user.name
         # possible timezone issues?
-        post_time = dateutil.parser.parse(post.publishedDatetime).astimezone(timezone.utc)
+        post_time = dateutil.parser.parse(post.publishedDatetime).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is None:
-            remote_post = self._get_post(main_id)
+            remote_post = await self._get_post(main_id)
         
-        if remote_post is None:
-            metadata = hoordu.Dynamic()
-            if post.feeRequired != 0:
-                metadata.price = post.feeRequired
-            
-            remote_post = RemotePost(
-                source=self.source,
-                original_id=main_id,
-                url=POST_FORMAT.format(creator=creator_slug, post_id=main_id),
-                title=post.title,
-                type=PostType.collection,
-                post_time=post_time,
-                metadata_=metadata.to_json()
-            )
-            
-            self.session.add(remote_post)
-            self.session.flush()
+        remote_post.url = POST_FORMAT.format(creator=creator_slug, post_id=main_id)
+        remote_post.type = PostType.collection
+        remote_post.post_time = post_time
+        
+        metadata = hoordu.Dynamic()
+        if post.feeRequired != 0:
+            metadata.price = post.feeRequired
+        
+        remote_post.metadata_ = metadata.to_json()
+        self.session.add(remote_post)
         
         self.log.info(f'downloading post: {remote_post.original_id}')
         self.log.info(f'local id: {remote_post.id}')
@@ -293,23 +284,23 @@ class Fanbox(SimplePluginBase):
             remote_post.favorite = True
         
         # creators are identified by their pixiv id because their name and creatorId can change
-        creator_tag = self._get_tag(TagCategory.artist, creator_id)
-        remote_post.add_tag(creator_tag)
+        creator_tag = await self._get_tag(TagCategory.artist, creator_id)
+        await remote_post.add_tag(creator_tag)
         
         if any((creator_tag.update_metadata('name', creator_name),
                 creator_tag.update_metadata('slug', creator_slug))):
             self.session.add(creator_tag)
         
         for tag in post.tags:
-            remote_tag = self._get_tag(TagCategory.general, tag)
-            remote_post.add_tag(remote_tag)
+            remote_tag = await self._get_tag(TagCategory.general, tag)
+            await remote_post.add_tag(remote_tag)
         
         if post.hasAdultContent is True:
-            nsfw_tag = self._get_tag(TagCategory.meta, 'nsfw')
-            remote_post.add_tag(nsfw_tag)
+            nsfw_tag = await self._get_tag(TagCategory.meta, 'nsfw')
+            await remote_post.add_tag(nsfw_tag)
         
-        current_files = {file.metadata_: file for file in remote_post.files}
-        current_urls = [r.url for r in remote_post.related]
+        current_files = {file.metadata_: file for file in await remote_post.fetch(RemotePost.files)}
+        current_urls = [r.url for r in  await remote_post.fetch(RemotePost.related)]
         
         if not post.isRestricted:
             if post.type == 'image':
@@ -320,7 +311,7 @@ class Fanbox(SimplePluginBase):
                     if file is None:
                         file = File(remote=remote_post, remote_order=order, metadata_=id)
                         self.session.add(file)
-                        self.session.flush()
+                        await self.session.flush()
                         
                     else:
                         file.remote_order = order
@@ -332,10 +323,10 @@ class Fanbox(SimplePluginBase):
                     if need_thumb or need_orig:
                         self.log.info(f'downloading file: {file.remote_order}')
                         
-                        orig = self._download_file(image.originalUrl) if need_orig else None
-                        thumb = self._download_file(image.thumbnailUrl) if need_thumb else None
+                        orig = await self._download_file(image.originalUrl) if need_orig else None
+                        thumb = await self._download_file(image.thumbnailUrl) if need_thumb else None
                         
-                        self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                        await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                 
                 remote_post.comment = post.body.text
                 self.session.add(remote_post)
@@ -349,7 +340,7 @@ class Fanbox(SimplePluginBase):
                         filename = '{0.name}.{0.extension}'.format(rfile)
                         file = File(remote=remote_post, remote_order=order, filename=filename, metadata_=id)
                         self.session.add(file)
-                        self.session.flush()
+                        await self.session.flush()
                         
                     else:
                         file.remote_order = order
@@ -360,9 +351,9 @@ class Fanbox(SimplePluginBase):
                     if need_orig:
                         self.log.info(f'downloading file: {file.remote_order}')
                         
-                        orig = self._download_file(rfile.url)
+                        orig = await self._download_file(rfile.url)
                         
-                        self.session.import_file(file, orig=orig, move=True)
+                        await self.session.import_file(file, orig=orig, move=True)
                 
                 remote_post.comment = post.body.text
                 self.session.add(remote_post)
@@ -383,7 +374,7 @@ class Fanbox(SimplePluginBase):
                             for link in links:
                                 url = link.url
                                 if url not in current_urls:
-                                    remote_post.add_related_url(url)
+                                     await remote_post.add_related_url(url)
                         
                         blog.append({
                             'type': 'text',
@@ -397,7 +388,7 @@ class Fanbox(SimplePluginBase):
                         if file is None:
                             file = File(remote=remote_post, remote_order=order, metadata_=id)
                             self.session.add(file)
-                            self.session.flush()
+                            await self.session.flush()
                             
                         else:
                             file.remote_order = order
@@ -412,10 +403,10 @@ class Fanbox(SimplePluginBase):
                         if need_thumb or need_orig:
                             self.log.info(f'downloading file: {file.remote_order}')
                             
-                            orig = self._download_file(orig_url) if need_orig else None
-                            thumb = self._download_file(thumb_url) if need_thumb else None
+                            orig = await self._download_file(orig_url) if need_orig else None
+                            thumb = await self._download_file(thumb_url) if need_thumb else None
                             
-                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                            await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         
                         blog.append({
                             'type': 'file',
@@ -431,7 +422,7 @@ class Fanbox(SimplePluginBase):
                         if file is None:
                             file = File(remote=remote_post, remote_order=order, metadata_=id)
                             self.session.add(file)
-                            self.session.flush()
+                            await self.session.flush()
                         
                         orig_url = filemap[block.fileId].url
                         thumb_url = post.coverImageUrl
@@ -442,10 +433,10 @@ class Fanbox(SimplePluginBase):
                         if need_thumb or need_orig:
                             self.log.info(f'downloading file: {file.remote_order}')
                             
-                            orig = self._download_file(orig_url) if need_orig else None
-                            thumb = self._download_file(thumb_url) if need_thumb else None
+                            orig = await self._download_file(orig_url) if need_orig else None
+                            thumb = await self._download_file(thumb_url) if need_thumb else None
                             
-                            self.session.import_file(file, orig=orig, thumb=thumb, move=True)
+                            await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         
                         blog.append({
                             'type': 'file',
@@ -460,8 +451,12 @@ class Fanbox(SimplePluginBase):
                         url = None
                         if embed.serviceProvider == 'fanbox':
                             related_post_id = embed.contentId.split('/')[-1]
-                            # TODO fix this if it's still a thing
-                            url = POST_FORMAT.format(post_id=related_post_id)
+                            
+                            async with self.http.get(POST_EMBED_INFO_URL.format(related_post_id=related_post_id)) as response:
+                                response.raise_for_status()
+                                related_post_body = hoordu.Dynamic.from_json(await response.text()).body
+                            
+                            url = POST_FORMAT.format(creator=related_post_body.creatorId, post_id=related_post_id)
                             
                         elif embed.serviceProvider == 'google_forms':
                             url = 'https://docs.google.com/forms/d/e/{}/viewform'.format(embed.contentId)
@@ -474,7 +469,7 @@ class Fanbox(SimplePluginBase):
                         
                         if url:
                             if url not in current_urls:
-                                remote_post.add_related_url(url)
+                                await remote_post.add_related_url(url)
                             
                             blog.append({
                                 'type': 'text',
@@ -490,12 +485,20 @@ class Fanbox(SimplePluginBase):
                             related_creator_id = urlembed.postInfo.creatorId
                             url = POST_FORMAT.format(creator=related_creator_id, post_id=related_post_id)
                             
+                        elif urlembed.type in ('html', 'html.card'):
+                            embed_html = BeautifulSoup(urlembed.html, 'html.parser')
+                            iframes = embed_html.select('iframe')
+                            if len(iframes) >= 1:
+                                url = iframes[0]['src']
+                            else:
+                                self.log.warning('no iframe found on html/card embed: %s', str(urlembed.html))
+                            
                         else:
                             self.log.warning('unknown url_embed type: %s', str(urlembed.type))
                         
                         if url:
                             if url not in current_urls:
-                                remote_post.add_related_url(url)
+                                await remote_post.add_related_url(url)
                             
                             blog.append({
                                 'type': 'text',
@@ -524,36 +527,38 @@ class Fanbox(SimplePluginBase):
         
         return remote_post
     
-    def download(self, id=None, remote_post=None, preview=False):
+    async def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
             raise ValueError('either id or remote_post must be passed')
         
         if remote_post is not None:
             id = remote_post.original_id
         
-        response = self.http.get(POST_GET_URL.format(post_id=id))
-        response.raise_for_status()
-        post = hoordu.Dynamic.from_json(response.text).body
+        async with self.http.get(POST_GET_URL.format(post_id=id)) as response:
+            response.raise_for_status()
+            post = hoordu.Dynamic.from_json(await response.text()).body
+        
         self.log.debug('post json: %s', post)
         
         if post.isRestricted:
             self.log.warning('inaccessible post %s', id)
         
-        return self._to_remote_post(post, remote_post=remote_post, preview=preview)
+        return await self._to_remote_post(post, remote_post=remote_post, preview=preview)
     
     def search_form(self):
         return Form('{} search'.format(self.name),
             ('creator', Input('creator', [validators.required()]))
         )
     
-    def get_search_details(self, options):
+    async def get_search_details(self, options):
         pixiv_id = options.get('pixiv_id')
         
         creator_id = self._get_creator_id(pixiv_id) if pixiv_id else options.creator 
         
-        response = self.http.get(CREATOR_GET_URL.format(creator=creator_id))
-        response.raise_for_status()
-        creator = hoordu.Dynamic.from_json(response.text).body
+        async with self.http.get(CREATOR_GET_URL.format(creator=creator_id)) as response:
+            response.raise_for_status()
+            creator = hoordu.Dynamic.from_json(await response.text()).body
+        
         options.creator = creator_id
         options.pixiv_id = creator.user.userId
         
@@ -567,9 +572,6 @@ class Fanbox(SimplePluginBase):
             thumbnail_url=creator.user.iconUrl,
             related_urls=creator.profileLinks
         )
-    
-    def subscription_repr(self, options):
-        return 'posts:{}'.format(options.pixiv_id)
 
 Plugin = Fanbox
 
