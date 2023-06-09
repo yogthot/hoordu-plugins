@@ -107,6 +107,7 @@ class CreatorIterator(IteratorBase['Patreon']):
         
         while True:
             page = await self._get_page(cursor)
+
             includes = IncludedMap(page.included)
             
             if cursor is None and len(page.data) > 0:
@@ -124,7 +125,9 @@ class CreatorIterator(IteratorBase['Patreon']):
             if cursors is None:
                 return
             
-            cursor = page.meta.pagination.cursors.next
+            cursor = cursors.next
+            if cursor is None:
+                return
     
     async def generator(self):
         async for post, included in self._post_iterator():
@@ -214,7 +217,15 @@ class Patreon(SimplePlugin):
             self._headers = {
                 'Origin': 'https://www.patreon.com/',
                 'Referer': 'https://www.patreon.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) Gecko/20100101 Firefox/82.0'
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'TE': 'trailers',
             }
             self._cookies = {
                 'session_id': self.config.session_id
@@ -352,6 +363,10 @@ class Patreon(SimplePlugin):
             
             need_orig = not file.present and orig_url is not None and not preview
             need_thumb = not file.thumb_present and thumb_url is not None
+            
+            # handle stupid url filenames
+            if '/' in orig_filename:
+                orig_filename = None
             
             if need_thumb or need_orig:
                 self.log.info(f'downloading file: {file.remote_order}')

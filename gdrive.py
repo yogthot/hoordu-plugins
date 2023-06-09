@@ -214,7 +214,6 @@ class GDrive(SimplePlugin):
         except OAuthError as e:
             self.log.warning('refresh token was invalid')
             #msg = hoordu.Dynamic.from_json(str(e))
-            await self.session.rollback()
             
             # refresh token expired or revoked
             config.pop('access_token')

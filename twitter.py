@@ -10,6 +10,7 @@ import dateutil.parser
 
 import aiohttp
 import contextlib
+import asyncio
 
 import hoordu
 from hoordu.models import *
@@ -59,18 +60,32 @@ class TwitterClient:
     
     @contextlib.asynccontextmanager
     async def _get(self, *args, **kwargs):
-        async with self.http.get(*args, **kwargs) as resp:
-            if resp.status == 401:
-                self.access_token = await self.refresh_token_cb()
-                
-                self.http.headers['Authorization'] = f'Bearer {self.access_token}'
-                
-                async with self.http.get(*args, **kwargs) as resp_retry:
-                    yield resp_retry
+        #await asyncio.sleep(1)
+        
+        retries = 1
+        token_expired = False
+        while retries > 0:
+            retries -= 1
+            
+            async with self.http.get(*args, **kwargs) as resp:
+                if resp.status == 401:
+                    token_expired = True
+                    
+                else:
+                    token_expired = False
+                    yield resp
                     return
             
-            yield resp
-            return
+            await asyncio.sleep(1)
+        
+        if token_expired:
+            self.access_token = await self.refresh_token_cb()
+            
+            self.http.headers['Authorization'] = f'Bearer {self.access_token}'
+            
+            async with self.http.get(*args, **kwargs) as resp_retry:
+                yield resp_retry
+                return
     
     async def get_user(self, user_id=None, *, username=None, full=False):
         params = {
@@ -397,7 +412,6 @@ class Twitter(SimplePlugin):
             
         except OAuthError as e:
             self.log.warning('refresh token was invalid')
-            await self.session.rollback()
             
             # refresh token expired or revoked
             config.pop('access_token')
@@ -565,7 +579,13 @@ class Twitter(SimplePlugin):
         
         media_keys = tweet.get_path('attachments', 'media_keys')
         if media_keys is not None:
-            media_list = [includes['media', key] for key in media_keys]
+            media_list = [includes.get(('media', key)) for key in media_keys]
+            
+            if None in media_list:
+                self.log.warning('recovering included media')
+                body = await self.api.get_tweet(tweet.id)
+                tmp_includes = IncludesMap(body.includes)
+                media_list = [tmp_includes.get(('media', key)) for key in media_keys]
             
             available = set(range(len(media_list)))
             present = set(file.remote_order for file in await remote_post.fetch(RemotePost.files))

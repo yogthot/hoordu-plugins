@@ -45,6 +45,8 @@ class CreatorIterator(IteratorBase['Fanbox']):
         self.state.head_id = self.state.get('head_id')
         self.state.tail_id = self.state.get('tail_id')
         self.state.tail_datetime = self.state.get('tail_datetime')
+        
+        self.downloaded = set()
     
     def __repr__(self):
         return 'posts:{}'.format(self.options.pixiv_id)
@@ -80,6 +82,9 @@ class CreatorIterator(IteratorBase['Fanbox']):
                 num_posts = None
         
         super().reconfigure(direction=direction, num_posts=num_posts)
+        
+        self.total = 0
+        self.downloaded = set()
     
     async def _post_iterator(self):
         head = (self.direction == FetchDirection.newer)
@@ -88,12 +93,11 @@ class CreatorIterator(IteratorBase['Fanbox']):
         max_id = self.state.tail_id if not head else None
         max_datetime = self.state.tail_datetime if not head else None
         
-        total = 0
         first_iteration = True
         while True:
             page_size = PAGE_LIMIT
             if self.num_posts is not None:
-                page_size = min(self.num_posts - total, PAGE_LIMIT)
+                page_size = min(self.num_posts - self.total, PAGE_LIMIT)
             
             params = {
                 'creatorId': self.options.creator,
@@ -132,8 +136,8 @@ class CreatorIterator(IteratorBase['Fanbox']):
                     self.state.tail_id = post.id
                     self.state.tail_datetime = post.publishedDatetime
                 
-                total += 1
-                if self.num_posts is not None and total >= self.num_posts:
+                self.total += 1
+                if self.num_posts is not None and self.total >= self.num_posts:
                     return
             
             if body.nextUrl is None:
@@ -143,12 +147,17 @@ class CreatorIterator(IteratorBase['Fanbox']):
     
     async def generator(self):
         async for post in self._post_iterator():
+            if post.id in self.downloaded:
+                continue
+            
             async with self.http.get(POST_GET_URL.format(post_id=post.id)) as response:
                 response.raise_for_status()
                 post_body = hoordu.Dynamic.from_json(await response.text()).body
             
             remote_post = await self.plugin._to_remote_post(post_body, preview=self.subscription is None)
             yield remote_post
+            
+            self.downloaded.add(post.id)
             
             if self.subscription is not None:
                 await self.subscription.add_post(remote_post)
@@ -267,6 +276,7 @@ class Fanbox(SimplePlugin):
             remote_post = await self._get_post(main_id)
         
         remote_post.url = POST_FORMAT.format(creator=creator_slug, post_id=main_id)
+        remote_post.title = post.title
         remote_post.type = PostType.collection
         remote_post.post_time = post_time
         
