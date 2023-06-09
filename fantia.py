@@ -136,13 +136,11 @@ class CreatorIterator(IteratorBase['Fantia']):
     
     async def generator(self):
         async for post in self._post_iterator():
-            remote_posts = await self.plugin._to_remote_posts(post, preview=self.subscription is None)
-            for remote_post in remote_posts:
-                yield remote_post
+            remote_post = await self.plugin._to_remote_post(post, preview=self.subscription is None)
+            yield remote_post
             
             if self.subscription is not None:
-                for p in remote_posts:
-                    await self.subscription.add_post(p)
+                await self.subscription.add_post(remote_post)
             
             await self.session.commit()
         
@@ -425,7 +423,7 @@ class Fantia(SimplePlugin):
         
         return remote_post
     
-    async def _to_remote_posts(self, post, remote_post=None, preview=False):
+    async def _to_remote_post(self, post, remote_post=None, preview=False):
         main_id = str(post.id)
         creator_id = str(post.fanclub.id)
         creator_name = post.fanclub.user.name
@@ -500,11 +498,9 @@ class Fantia(SimplePlugin):
                 await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
         
         # convert the post contents to posts as well
-        remote_posts = [remote_post]
         for content in post.post_contents:
             if content.visible_status == 'visible':
                 content_post = await self._content_to_post(post, content, preview=preview)
-                remote_posts.append(content_post)
                 
                 related = await remote_post.fetch(RemotePost.related)
                 if not any(r.remote_id == content_post.id for r in related):
@@ -512,7 +508,7 @@ class Fantia(SimplePlugin):
                 
                 await self.session.flush()
         
-        return remote_posts
+        return remote_post
     
     async def download(self, id=None, remote_post=None, preview=False):
         if id is None and remote_post is None:
@@ -526,11 +522,8 @@ class Fantia(SimplePlugin):
             response.raise_for_status()
             post = hoordu.Dynamic.from_json(await response.text()).post
         
-        remote_posts = await self._to_remote_posts(post, remote_post=remote_post, preview=preview)
-        if remote_posts is not None and len(remote_posts) > 0:
-            return remote_posts[0]
-        else:
-            return None
+        remote_post = await self._to_remote_post(post, remote_post=remote_post, preview=preview)
+        return remote_post
     
     def search_form(self):
         return Form('{} search'.format(self.name),
