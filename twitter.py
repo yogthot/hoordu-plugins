@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from tempfile import mkstemp
 import shutil
 from urllib.parse import urlparse
@@ -16,13 +16,12 @@ import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
-from hoordu.oauth.client import *
 
-AUTH_URL = 'https://twitter.com/i/oauth2/authorize'
-TOKEN_URL = 'https://api.twitter.com/2/oauth2/token'
-REDIRECT_URL = 'http://127.0.0.1:8941/twitter'
-SCOPES = 'tweet.read users.read bookmark.read offline.access'
-CHALLENGE_MODE = 'plain'
+TWEET_DETAIL_URL = 'https://twitter.com/i/api/graphql/Pn68XRZwyV9ClrAEmK8rrQ/TweetDetail'
+USER_BY_ID = 'https://twitter.com/i/api/graphql/8slyDObmnUzBOCu7kYZj_A/UserByRestId'
+USER_BY_SCREENNAME = 'https://twitter.com/i/api/graphql/qRednkZG-rn1P6b48NINmQ/UserByScreenName'
+TIMELINE_URL = 'https://twitter.com/i/api/graphql/2dNLofLWl-u8EQPURIAp9w/UserTweetsAndReplies'
+LIKES_URL = 'https://twitter.com/i/api/graphql/QPKcH_nml6UIOxHLjmNsuw/Likes'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
 TWEET_REGEXP = [
@@ -42,14 +41,41 @@ THUMB_SIZE = 'small'
 ORIG_SIZE = 'orig'
 PROFILE_THUMB_SIZE = '200x200'
 
-PAGE_LIMIT = 50 # 5 to 100
+PAGE_LIMIT = 40
 
 class TwitterClient:
-    def __init__(self, access_token, refresh_token_cb=None, app_auth=False):
-        self.access_token = access_token
-        self.refresh_token_cb = refresh_token_cb
-        self.http = aiohttp.ClientSession()
-        self.http.headers['Authorization'] = f'Bearer {access_token}'
+    def __init__(self, csrf, token, auth_token):
+        self.csrf = csrf
+        self.token = token
+        self.auth_token = auth_token
+        
+        cookies = {
+            #'guest_id': 'v1:167122743758400190',
+            'ct0': csrf,
+            #'kdt': 'hWhELjWzETg53Upq1zXYtf2IA4UxlExxOBPF5wqC',
+            #'twid': 'u=912706848',
+            'auth_token': auth_token,
+            #'d_prefs': 'MjoxLGNvbnNlbnRfdmVyc2lvbjoyLHRleHRfdmVyc2lvbjoxMDAw',
+            #'eu_cn': '1',
+            #'des_opt_in': 'N',
+            #'dnt': '1',
+        }
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/113.0',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://twitter.com/',
+            'authorization': f'Bearer {token}',
+            'x-twitter-auth-type': 'OAuth2Session',
+            'x-csrf-token': csrf,
+            #'x-twitter-client-language': 'en',
+            #'x-twitter-active-user': 'yes',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
+        }
+        
+        self.http = aiohttp.ClientSession(cookies=cookies, headers=headers)
+        #self.http.headers.update(**headers)
     
     async def __aenter__(self) -> 'TwitterClient':
         await self.http.__aenter__()
@@ -60,92 +86,145 @@ class TwitterClient:
     
     @contextlib.asynccontextmanager
     async def _get(self, *args, **kwargs):
-        #await asyncio.sleep(1)
-        
-        retries = 1
-        token_expired = False
-        while retries > 0:
-            retries -= 1
-            
-            async with self.http.get(*args, **kwargs) as resp:
-                if resp.status == 401:
-                    token_expired = True
-                    
-                else:
-                    token_expired = False
-                    yield resp
-                    return
-            
-            await asyncio.sleep(1)
-        
-        if token_expired:
-            self.access_token = await self.refresh_token_cb()
-            
-            self.http.headers['Authorization'] = f'Bearer {self.access_token}'
-            
-            async with self.http.get(*args, **kwargs) as resp_retry:
-                yield resp_retry
-                return
+        async with self.http.get(*args, **kwargs) as resp:
+            yield resp
+            return
     
-    async def get_user(self, user_id=None, *, username=None, full=False):
-        params = {
-            'user.fields': 'id,name,username',
+    async def get_user(self, user_id=None, *, username=None):
+        variables = {
+            'withSafetyModeUserFields': True,
         }
+        features = {
+            'hidden_profile_likes_enabled': False,
+            'responsive_web_graphql_exclude_directive_enabled': True,
+            'verified_phone_label_enabled': False,
+            'highlights_tweets_tab_ui_enabled': True,
+            'creator_subscriptions_tweet_preview_api_enabled': True,
+            'responsive_web_graphql_skip_user_profile_image_extensions_enabled': False,
+            'responsive_web_graphql_timeline_navigation_enabled': True,
+        }
+        
         if user_id is not None:
-            url = f'https://api.twitter.com/2/users/{user_id}'
+            url = USER_BY_ID
+            variables['userId'] = user_id
             
         elif username is not None:
-            url = 'https://api.twitter.com/2/users/by'
-            params['usernames'] = username
+            url = USER_BY_SCREENNAME
+            variables['screen_name'] = username
+            features['subscriptions_verification_info_verified_since_enabled'] = True
         
-        if full:
-            params['user.fields'] = 'id,name,username,created_at,description,profile_image_url,verified,entities'
+        params = {
+            'variables': json.dumps(variables),
+            'features': json.dumps(features),
+        }
         
         async with self._get(url, params=params) as resp:
-            return hoordu.Dynamic.from_json(await resp.text())
+            body = hoordu.Dynamic.from_json(await resp.text())
+        
+        user = body.get_path('data', 'user', 'result')
+        
+        if user is None:
+            raise APIError('This account does not exist')
+        
+        if user['__typename'] == 'UserUnavailable':
+            raise APIError(f'{user.reason}: {user.unavailable_message.text}')
+        
+        return user
     
     async def get_tweet(self, tweet_id):
-        params = {
-            'ids': str(tweet_id),
-            'expansions': 'author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id',
-            'tweet.fields': 'attachments,author_id,created_at,entities,id,lang,possibly_sensitive,'
-                            'public_metrics,referenced_tweets,source,text,withheld,in_reply_to_user_id',
-            'user.fields': 'id,name,username',
-            'media.fields': 'media_key,type,url,preview_image_url,variants',
+        #tweet_id = str(tweet_id)
+        variables = {
+            'focalTweetId': tweet_id,
+            'with_rux_injections': False,
+            'includePromotedContent': True,
+            'withCommunity': True,
+            'withQuickPromoteEligibilityTweetFields': True,
+            'withBirdwatchNotes': True,
+            'withVoice': True,
+            'withV2Timeline': True,
         }
-        url = 'https://api.twitter.com/2/tweets'
-        
-        async with self._get(url, params=params) as resp:
-            return hoordu.Dynamic.from_json(await resp.text())
-    
-    async def get_timeline(self, user_id, **kwargs):
-        params = {
-            'expansions': 'author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,in_reply_to_user_id',
-            'tweet.fields': 'attachments,author_id,created_at,entities,id,lang,possibly_sensitive,'
-                            'public_metrics,referenced_tweets,source,text,withheld,in_reply_to_user_id',
-            'user.fields': 'id,name,username',
-            'media.fields': 'media_key,type,url,preview_image_url,variants',
-            'max_results': str(PAGE_LIMIT),
+        features = {
+            'rweb_lists_timeline_redesign_enabled': True,
+            'responsive_web_graphql_exclude_directive_enabled': True,
+            'verified_phone_label_enabled': False,
+            'creator_subscriptions_tweet_preview_api_enabled': True,
+            'responsive_web_graphql_timeline_navigation_enabled': True,
+            'responsive_web_graphql_skip_user_profile_image_extensions_enabled': False,
+            'tweetypie_unmention_optimization_enabled': True,
+            'responsive_web_edit_tweet_api_enabled': True,
+            'graphql_is_translatable_rweb_tweet_is_translatable_enabled': True,
+            'view_counts_everywhere_api_enabled': True,
+            'longform_notetweets_consumption_enabled': True,
+            'tweet_awards_web_tipping_enabled': False,
+            'freedom_of_speech_not_reach_fetch_enabled': True,
+            'standardized_nudges_misinfo': True,
+            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': False,
+            'longform_notetweets_rich_text_read_enabled': True,
+            'longform_notetweets_inline_media_enabled': False,
+            'responsive_web_enhance_cards_enabled': False,
         }
-        params.update(kwargs)
-        url = f'https://api.twitter.com/2/users/{user_id}/tweets'
+        params = {
+            'variables': json.dumps(variables),
+            'features': json.dumps(features),
+        }
         
-        async with self._get(url, params=params) as resp:
-            return hoordu.Dynamic.from_json(await resp.text())
-
-
-class IncludesMap(OrderedDict):
-    def __init__(self, includes_obj):
-        super().__init__()
+        async with self._get(TWEET_DETAIL_URL, params=params) as resp:
+            body = hoordu.Dynamic.from_json(await resp.text())
         
-        self._add_section(includes_obj, 'users', 'id')
-        self._add_section(includes_obj, 'tweets', 'id')
-        self._add_section(includes_obj, 'media', 'media_key')
+        instructions = body.data.threaded_conversation_with_injections_v2.instructions
+        for inst in instructions:
+            if inst.type == 'TimelineAddEntries':
+                entries = inst.entries
+                for entry in entries:
+                    if entry.content.entryType == 'TimelineTimelineItem' \
+                            and entry.content.itemContent.itemType == 'TimelineTweet':
+                        tweet = entry.content.itemContent.tweet_results.result
+                        if 'tweet' in tweet: tweet = tweet.tweet
+                        if tweet.rest_id == tweet_id:
+                            return tweet
+        
     
-    def _add_section(self, includes_obj, key, id_key):
-        if key in includes_obj:
-            for include in includes_obj[key]:
-                self[(key, include[id_key])] = include
+    async def get_timeline(self, user_id, count=PAGE_LIMIT, cursor=None):
+        # all tweets, including replies
+        variables = {
+            'userId': user_id,
+            'count': count,
+            'includePromotedContent': True,
+            'withCommunity': True,
+            'withVoice': True,
+            'withV2Timeline': True,
+        }
+        features = {
+            'rweb_lists_timeline_redesign_enabled': True,
+            'responsive_web_graphql_exclude_directive_enabled': True,
+            'verified_phone_label_enabled': False,
+            'creator_subscriptions_tweet_preview_api_enabled': True,
+            'responsive_web_graphql_timeline_navigation_enabled': True,
+            'responsive_web_graphql_skip_user_profile_image_extensions_enabled': False,
+            'tweetypie_unmention_optimization_enabled': True,
+            'responsive_web_edit_tweet_api_enabled': True,
+            'graphql_is_translatable_rweb_tweet_is_translatable_enabled': True,
+            'view_counts_everywhere_api_enabled': True,
+            'longform_notetweets_consumption_enabled': True,
+            'tweet_awards_web_tipping_enabled': False,
+            'freedom_of_speech_not_reach_fetch_enabled': True,
+            'standardized_nudges_misinfo': True,
+            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': False,
+            'longform_notetweets_rich_text_read_enabled': True,
+            'longform_notetweets_inline_media_enabled': False,
+            'responsive_web_enhance_cards_enabled': False,
+        }
+        
+        if cursor is not None:
+            variables['cursor'] = cursor
+        
+        params = {
+            'variables': json.dumps(variables),
+            'features': json.dumps(features),
+        }
+        
+        async with self._get(TIMELINE_URL, params=params) as resp:
+            return hoordu.Dynamic.from_json(await resp.text())
 
 
 class TweetIterator(IteratorBase['Twitter']):
@@ -167,89 +246,141 @@ class TweetIterator(IteratorBase['Twitter']):
         if self.options.user_id is None:
             user = await self.api.get_user(username=self.options.user)
             
-            self.options.user_id = user.id
+            self.options.user_id = user.rest_id
             
             if self.subscription is not None:
                 self.subscription.options = self.options.to_json()
                 self.session.add(self.subscription)
+            
+        else:
+            user = await self.api.get_user(user_id=self.options.user_id)
+            
     
     def reconfigure(self, direction=FetchDirection.newer, num_posts=None):
         if direction == FetchDirection.newer:
             if self.state.tail_id is None:
                 direction = FetchDirection.older
-            else:
-                num_posts = None
+        
+        num_posts = None
         
         super().reconfigure(direction=direction, num_posts=num_posts)
     
-    async def _feed_iterator(self):
-        limit = self.num_posts
+    def _validate_user(self, tweet):
+        tweet_user_id = tweet.core.user_results.result.rest_id
+        is_same_user = (tweet_user_id == self.options.user_id)
         
-        #since_id=<get tweets more recent than this, exclude>
-        #until_id=<get tweets older than this, exclude>
+        # if self.options.method == 'likes ??
         
-        #pagination_token=body.page.meta.next_token can be used when iterating, but not from state
-        
-        kwargs = {}
-        
-        if self.direction == FetchDirection.newer:
-            if self.state.head_id is not None:
-                kwargs['since_id'] = self.state.head_id
-            
-        else:
-            if self.state.tail_id is not None:
-                kwargs['until_id'] = self.state.tail_id
-        
-        if self.options.method != 'retweets':
-            kwargs['exclude'] = 'retweets'
-        
-        total = 0
-        while True:
-            page_size = PAGE_LIMIT if limit is None else max(min(limit - total, PAGE_LIMIT), 5)
-            kwargs['max_results'] = str(page_size)
-            
-            self.log.info('getting next page')
-            body = await self.api.get_timeline(self.options.user_id, **kwargs)
-            
-            if not body.contains('data'):
-                return
-            
-            tweets = body.data
-            includes = IncludesMap(body.includes)
-            
-            for tweet in tweets:
-                yield tweet, includes
-                kwargs['until_id'] = tweet.id
-                
-                total += 1
-                if limit is not None and total >= limit:
-                    return
+        return is_same_user
     
-    def _tweet_has_content(self, tweet, includes):
-        retweeted_id = self.plugin._referenced_tweet_id(tweet, 'retweeted')
-        if retweeted_id is not None:
-            tweet = includes['tweets', retweeted_id]
+    async def _feed_iterator(self):
+        cursor = None
+        count = PAGE_LIMIT
         
-        media_keys = tweet.get_path('attachments', 'media_keys')
-        urls = tweet.get_path('entities', 'urls')
+        while True:
+            self.log.info('getting next page')
+            body = await self.api.get_timeline(self.options.user_id, count=count, cursor=cursor)
+            
+            try:
+                instructions = body.data.user.result.timeline_v2.timeline.instructions
+            except:
+                print(body)
+                raise
+            
+            for inst in instructions:
+                if inst.type == 'TimelinePinEntry':
+                    entry = inst.entry
+                    sort_id = entry.sortIndex
+                    if entry.content.entryType == 'TimelineTimelineItem':
+                        tweet = entry.content.itemContent.tweet_results.result
+                        if 'tweet' in tweet: tweet = tweet.tweet
+                        if self._validate_user(tweet):
+                            yield True, tweet
+                    
+                elif inst.type == 'TimelineAddEntries':
+                    for entry in inst.entries:
+                        entryType = entry.entryId.rsplit('-', 1)[0]
+                        if entryType == 'tweet':
+                            tweet = entry.content.itemContent.tweet_results.result
+                            if 'tweet' in tweet: tweet = tweet.tweet
+                            if self._validate_user(tweet):
+                                yield False, tweet
+                            
+                        elif entryType == 'profile-conversation':
+                            for item in entry.content['items']:
+                                tweet = content = item.item.itemContent.tweet_results.result
+                                if 'tweet' in tweet: tweet = tweet.tweet
+                                if self._validate_user(tweet):
+                                    yield False, tweet
+                            
+                        elif entryType == 'cursor-bottom':
+                            cursor = entry.content.value
+                            
+                        elif entryType in ('who-to-follow', 'cursor-top'):
+                            # nop
+                            pass
+                            
+                        elif entryType.startswith('promoted-tweet'):
+                            pass
+                            
+                        else:
+                            raise NotImplementedError(f'unknown entry type: {entry.entryId}')
+                    
+                    if len(inst.entries) == 2:
+                        # hopefully this is the last page?
+                        # only 2 cursor entries...
+                        return
+                    
+                elif inst.type in ('TimelineClearCache', 'TimelineTimelineModule'):
+                    # nop
+                    pass
+                    
+                else:
+                    raise NotImplementedError(f'unknown instruction type: {inst.type}')
+    
+    def _validate_method(self, tweet):
+        is_retweet = False
+        retweeted = tweet.legacy.get('retweeted_status_result')
+        if retweeted is not None:
+            is_retweet = True
+            tweet = retweeted.result
+            if 'tweet' in tweet: tweet = tweet.tweet
         
-        return ((
-            media_keys is not None and
-            len(media_keys) > 0
+        media_list = tweet.legacy.get_path('extended_entities', 'media')
+        urls = tweet.legacy.get_path('entities', 'urls')
+        
+        has_media = ((
+            media_list is not None and
+            len(media_list) > 0
         ) or (
             urls is not None and
             len(urls) > 0
         ))
+        
+        if self.options.method == 'retweets':
+            return has_media and is_retweet
+            
+        elif self.options.method == 'tweets':
+            return has_media and not is_retweet
+            
+        elif self.options.method == 'likes':
+            raise NotImplementedError
     
     async def generator(self):
-        first_iteration = True
+        is_first_tweet = True
         
-        async for tweet, includes in self._feed_iterator():
-            if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
-                self.first_id = tweet.id
+        async for is_pinned, tweet in self._feed_iterator():
+            if not is_pinned and is_first_tweet:
+                if self.state.head_id is None or self.direction == FetchDirection.newer:
+                    self.first_id = tweet.rest_id
+                
+                is_first_tweet = False
             
-            if self._tweet_has_content(tweet, includes):
-                remote_post = await self.plugin._to_remote_post(tweet, includes, preview=self.subscription is None)
+            if not is_pinned and self.direction == FetchDirection.newer and int(tweet.rest_id) <= int(self.state.head_id):
+                break
+            
+            if self._validate_method(tweet):
+                remote_post = await self.plugin._to_remote_post(tweet, preview=self.subscription is None)
                 yield remote_post
                 
                 if self.subscription is not None:
@@ -257,10 +388,8 @@ class TweetIterator(IteratorBase['Twitter']):
                 
                 await self.session.commit()
             
-            if self.direction == FetchDirection.older:
-                self.state.tail_id = tweet.id
-            
-            first_iteration = False
+            if not is_pinned and self.direction == FetchDirection.older:
+                self.state.tail_id = tweet.rest_id
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -275,16 +404,15 @@ class TweetIterator(IteratorBase['Twitter']):
 
 class Twitter(SimplePlugin):
     name = 'twitter'
-    version = 4
+    version = 5
     iterator = TweetIterator
     
     @classmethod
     def config_form(cls):
         return Form('{} config'.format(cls.name),
-            ('client_id', Input('client id', [validators.required])),
-            ('client_secret', Input('client secret', [validators.required])),
-            ('access_token', Input('access token')),
-            ('refresh_token', Input('refresh token'))
+            ('csrf', Input('csrf', [validators.required])),
+            ('bearer_token', Input('bearer token', [validators.required])),
+            ('auth_token', Input('auth token', [validators.required])),
         )
     
     @classmethod
@@ -301,46 +429,9 @@ class Twitter(SimplePlugin):
             plugin.config = config.to_json()
             session.add(plugin)
         
-        if not config.contains('client_id', 'client_secret'):
+        if not config.contains('csrf', 'bearer_token', 'auth_token'):
             # but if they're still None, the api can't be used
             return False, cls.config_form()
-        
-        elif not config.contains('access_token', 'refresh_token'):
-            code = None
-            if parameters is not None:
-                code = parameters.get('code')
-            
-            oauth = OAuth(**{
-                'auth_url': AUTH_URL,
-                'token_url': TOKEN_URL,
-                'redirect_uri': REDIRECT_URL, # TODO move redirect uri to base class
-                'scopes': SCOPES,
-                'client_id': config.client_id,
-                'client_secret': config.client_secret,
-                'code_challenge_method': CHALLENGE_MODE,
-            })
-            
-            if code is None:
-                url, state, challenge = oauth.auth_url(use_state=True, use_code_verifier=True)
-                
-                config.state = state
-                config.challenge = challenge
-                plugin.config = config.to_json()
-                session.add(plugin)
-                
-                return False, OAuthForm('twitter authentication', url)
-                
-            else:
-                response = await oauth.get_access_token(code, code_verifier=config.challenge)
-                
-                config.access_token = response['access_token']
-                config.refresh_token = response['refresh_token']
-                config.pop('state')
-                config.pop('challenge')
-                plugin.config = config.to_json()
-                session.add(plugin)
-                
-                return True, None
             
         else:
             # the config contains every required property
@@ -386,58 +477,9 @@ class Twitter(SimplePlugin):
     @contextlib.asynccontextmanager
     async def context(self):
         async with super().context():
-            self.oauth = OAuth(**{
-                'auth_url': AUTH_URL,
-                'token_url': TOKEN_URL,
-                'redirect_uri': REDIRECT_URL,
-                'scopes': SCOPES,
-                'client_id': self.config.client_id,
-                'client_secret': self.config.client_secret,
-                'code_challenge_method': CHALLENGE_MODE,
-            })
-            
-            async with TwitterClient(self.config.access_token, self._refresh_token) as api:
+            async with TwitterClient(self.config.csrf, self.config.bearer_token, self.config.auth_token) as api:
                 self.api: TwitterClient = api
                 yield self
-    
-    # TODO maybe move this to a base class
-    async def _refresh_token(self):
-        session = self.session.priority
-        plugin = await self.get_plugin(session)
-        config = hoordu.Dynamic.from_json(plugin.config)
-        
-        try:
-            self.log.info('attempting to refresh access token')
-            tokens = await self.oauth.refresh_access_token(config.refresh_token)
-            
-        except OAuthError as e:
-            self.log.warning('refresh token was invalid')
-            
-            # refresh token expired or revoked
-            config.pop('access_token')
-            config.pop('refresh_token')
-            plugin.config = config.to_json()
-            session.add(plugin)
-            await session.commit()
-            
-            raise
-        
-        access_token = tokens['access_token']
-        refresh_token = tokens.get('refresh_token')
-        
-        self.config.access_token = access_token
-        config.access_token = access_token
-        
-        if refresh_token is not None:
-            self.config.refresh_token = refresh_token
-            config.refresh_token = refresh_token
-        
-        # update access_token in the database
-        plugin.config = config.to_json()
-        session.add(plugin)
-        await session.commit()
-        
-        return access_token
     
     async def _unwind_url(self, url, iterations=20):
         final_url = url
@@ -487,11 +529,13 @@ class Twitter(SimplePlugin):
         return path
     
     async def _download_video(self, media):
-        variants = media.get('variants', [])
+        variants = media.get_path('video_info', 'variants')
+        if variants is None:
+            variants = []
         
         variant = max(
-            [v for v in variants if 'bit_rate' in v],
-            key=lambda v: v['bit_rate'],
+            [v for v in variants if 'bitrate' in v],
+            key=lambda v: v['bitrate'],
             default=None
         )
         
@@ -501,24 +545,20 @@ class Twitter(SimplePlugin):
         else:
             return None
     
-    def _referenced_tweet_id(self, tweet, type):
-        references = tweet.get('referenced_tweets')
-        if references is None: return None
-        return next((t.id for t in tweet.referenced_tweets if t.type == type), None)
-    
-    async def _to_remote_post(self, tweet, includes, remote_post=None, preview=False):
+    async def _to_remote_post(self, tweet, remote_post=None, preview=False):
         # get the original tweet if this is a retweet
-        retweeted_id = self._referenced_tweet_id(tweet, 'retweeted')
-        if retweeted_id is not None:
-            tweet = includes['tweets', retweeted_id]
+        retweeted = tweet.legacy.get('retweeted_status_result')
+        if retweeted is not None:
+            tweet = retweeted.result
+            if 'tweet' in tweet: tweet = tweet.tweet
         
-        author = includes['users', tweet.author_id]
+        author = tweet.core.user_results.result
         
-        original_id = tweet.id
-        user = author.username
-        user_id = tweet.author_id
-        text = tweet.text
-        post_time = dateutil.parser.isoparse(tweet.created_at).replace(tzinfo=None)
+        original_id = tweet.rest_id
+        user = author.legacy.screen_name
+        user_id = author.rest_id
+        text = tweet.legacy.full_text
+        post_time = dateutil.parser.parse(tweet.legacy.created_at).astimezone(timezone.utc).replace(tzinfo=None)
         
         if remote_post is None:
             remote_post = await self._get_post(original_id)
@@ -539,54 +579,40 @@ class Twitter(SimplePlugin):
         if user_tag.update_metadata('user', user):
             self.session.add(user_tag)
         
-        if tweet.possibly_sensitive:
+        if tweet.legacy.possibly_sensitive:
             nsfw_tag = await self._get_tag(TagCategory.meta, 'nsfw')
             await remote_post.add_tag(nsfw_tag)
         
-        hashtags = tweet.get_path('entities', 'hashtags')
+        hashtags = tweet.legacy.get_path('entities', 'hashtags')
         if hashtags is not None:
             for hashtag in hashtags:
-                tag = await self._get_tag(TagCategory.general, hashtag.tag)
+                tag = await self._get_tag(TagCategory.general, hashtag.text)
                 await remote_post.add_tag(tag)
         
-        async def add_related_tweet(type):
-            related_id = self._referenced_tweet_id(tweet, type)
-            if related_id is not None:
-                related_tweet = includes.get(('tweets', related_id))
-                if related_tweet is not None:
-                    related_user = includes['users', related_tweet.author_id]
-                    url = TWEET_FORMAT.format(user=related_user.username, tweet_id=related_id)
-                    await remote_post.add_related_url(url)
+        async def add_related_tweet(related):
+            if 'tweet' in related: related = related.tweet
+            related_id = related.rest_id
+            related_user = related.core.user_results.result
+            url = TWEET_FORMAT.format(user=related_user.legacy.screen_name, tweet_id=related_id)
+            await remote_post.add_related_url(url)
         
-        await add_related_tweet('replied_to')
-        await add_related_tweet('quoted')
+        # no easy way to get this now
+        #await add_related_tweet('replied_to')
         
-        urls = tweet.get_path('entities', 'urls')
+        quoted = tweet.get_path('quoted_status_result', 'result')
+        if quoted is not None:
+            await add_related_tweet(quoted)
+        
+        urls = tweet.legacy.get_path('entities', 'urls')
         if urls is not None:
             for url in urls:
-                # let's pretend this does not happen anymore
-                #if SUPPORT_URL_REGEXP.match(url.url):
-                #    raise APIError(text)
-                
-                #final_url = self._unwind_url(url.url)
-                
-                # quick way of filtering photo/quote urls from more relevant ones
-                unwound = url.get('unwound_url')
-                if unwound is not None:
-                    await remote_post.add_related_url(unwound)
+                # hopefully no t.co bullshit here
+                await remote_post.add_related_url(url.expanded_url)
         
         self.session.add(remote_post)
         
-        media_keys = tweet.get_path('attachments', 'media_keys')
-        if media_keys is not None:
-            media_list = [includes.get(('media', key)) for key in media_keys]
-            
-            if None in media_list:
-                self.log.warning('recovering included media')
-                body = await self.api.get_tweet(tweet.id)
-                tmp_includes = IncludesMap(body.includes)
-                media_list = [tmp_includes.get(('media', key)) for key in media_keys]
-            
+        media_list = tweet.legacy.get_path('extended_entities', 'media')
+        if media_list is not None:
             available = set(range(len(media_list)))
             present = set(file.remote_order for file in await remote_post.fetch(RemotePost.files))
             
@@ -607,7 +633,7 @@ class Twitter(SimplePlugin):
                     orig = None
                     
                     if media.type == 'photo':
-                        base_url, ext = media.url.rsplit('.', 1)
+                        base_url, ext = media.media_url_https.rsplit('.', 1)
                         filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
                         
                         if need_thumb:
@@ -621,8 +647,8 @@ class Twitter(SimplePlugin):
                         file.thumb_ext = ext
                         self.session.add(file)
                         
-                    elif media.type == 'video' or media.type == 'animated_gif':
-                        base_url, ext = media.preview_image_url.rsplit('.', 1)
+                    elif media.type in ('video', 'animated_gif'):
+                        base_url, ext = media.media_url_https.rsplit('.', 1)
                         filename = '{}.{}'.format(base_url.rsplit('/', 1)[-1], ext)
                         
                         if need_thumb:
@@ -634,6 +660,9 @@ class Twitter(SimplePlugin):
                         await self.session.import_file(file, orig=orig, thumb=thumb, move=True)
                         file.thumb_ext = ext
                         self.session.add(file)
+                        
+                    else:
+                        raise NotImplementedError('unknown media type: {}'.format(media.type))
         
         return remote_post
     
@@ -644,11 +673,9 @@ class Twitter(SimplePlugin):
         if remote_post is not None:
             id = remote_post.original_id
         
-        body = await self.api.get_tweet(id)
-        tweet = body.data[0]
-        includes = IncludesMap(body.includes)
+        tweet = await self.api.get_tweet(id)
         
-        return await self._to_remote_post(tweet, includes, remote_post=remote_post, preview=preview)
+        return await self._to_remote_post(tweet, remote_post=remote_post, preview=preview)
     
     def search_form(self):
         return Form('{} search'.format(self.name),
@@ -663,25 +690,23 @@ class Twitter(SimplePlugin):
     async def get_search_details(self, options):
         user_id = options.get('user_id')
         kwargs = {'user_id': user_id} if user_id else {'username': options.user} 
-        kwargs['full'] = True
         
-        body = await self.api.get_user(**kwargs)
-        user = body.data[0]
-        options.user_id = user.id
+        user = await self.api.get_user(**kwargs)
+        options.user_id = user.rest_id
         
-        urls = user.get_path('entities', 'url', 'urls') or []
-        description_urls = user.get_path('entities', 'description', 'urls') or []
+        urls = user.legacy.get_path('entities', 'url', 'urls') or []
+        description_urls = user.legacy.get_path('entities', 'description', 'urls') or []
         related_urls = {u.expanded_url for u in urls + description_urls}
         
-        thumb_url = user.profile_image_url
+        thumb_url = user.legacy.profile_image_url_https
         match = PROFILE_IMAGE_REGEXP.match(thumb_url)
         if match:
             thumb_url = match.group('base') + PROFILE_THUMB_SIZE + match.group('ext')
         
         return SearchDetails(
-            hint=user.username,
-            title=user.name,
-            description=user.description,
+            hint=user.legacy.screen_name,
+            title=user.legacy.name,
+            description=user.legacy.description,
             thumbnail_url=thumb_url,
             related_urls=related_urls
         )
