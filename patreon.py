@@ -9,6 +9,7 @@ import shutil
 from urllib.parse import urlparse
 import itertools
 import functools
+import asyncio
 
 import aiohttp
 import contextlib
@@ -54,6 +55,9 @@ class CreatorIterator(IteratorBase['Patreon']):
         
         self.first_timestamp = None
         self.state.head_timestamp = self.state.get('head_timestamp')
+        
+        self.downloaded = set()
+        self.cached_page = None
         
         if self.state.head_timestamp is None:
             self.head_timestamp = None
@@ -105,9 +109,18 @@ class CreatorIterator(IteratorBase['Patreon']):
     async def _post_iterator(self):
         cursor = None
         
+        use_cached = self.cached_page is not None
+        
         while True:
-            page = await self._get_page(cursor)
-
+            if not use_cached:
+                page = await self._get_page(cursor)
+                self.cached_page = page
+            else:
+                self.log.info('using cached page')
+                page = self.cached_page
+            
+            use_cached = False
+            
             includes = IncludedMap(page.included)
             
             if cursor is None and len(page.data) > 0:
@@ -131,8 +144,12 @@ class CreatorIterator(IteratorBase['Patreon']):
     
     async def generator(self):
         async for post, included in self._post_iterator():
+            if post.id in self.downloaded:
+                continue
+            
             remote_post = await self.plugin._to_remote_post(post, included, preview=self.subscription is None)
             yield remote_post
+            self.downloaded.add(post.id)
             
             if self.subscription is not None:
                 await self.subscription.add_post(remote_post)
@@ -248,6 +265,7 @@ class Patreon(SimplePlugin):
     
     async def _download_file(self, url, filename=None):
         path, resp = await self.session.download(url, headers=self._headers, cookies=self._cookies, suffix=filename)
+        await asyncio.sleep(1)
         return path
     
     async def _to_remote_post(self, post_obj, included, remote_post=None, preview=False):
@@ -347,8 +365,7 @@ class Patreon(SimplePlugin):
                 orig_url = attributes.image_urls.original
                 thumb_url = attributes.image_urls.default
                 
-                if post.post_type not in ('video_embed'):
-                    orig_filename = attributes.file_name
+                orig_filename = attributes.file_name
             
             file = current_files.get(id)
             
