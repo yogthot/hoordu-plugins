@@ -563,7 +563,7 @@ class Fanbox(SimplePlugin):
     async def get_search_details(self, options):
         pixiv_id = options.get('pixiv_id')
         
-        creator_id = self._get_creator_id(pixiv_id) if pixiv_id else options.creator 
+        creator_id = await self._get_creator_id(pixiv_id) if pixiv_id else options.creator 
         
         async with self.http.get(CREATOR_GET_URL.format(creator=creator_id)) as response:
             response.raise_for_status()
