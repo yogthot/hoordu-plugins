@@ -17,6 +17,7 @@ import hoordu
 from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
+from hoordu.util import save_data_uri
 
 POST_FORMAT = 'https://fantia.jp/posts/{post_id}'
 POST_REGEXP = re.compile('^https?:\/\/fantia\.jp\/posts\/(?P<post_id>\d+)(?:\?.*)?(?:#.*)?$', flags=re.IGNORECASE)
@@ -235,7 +236,12 @@ class Fantia(SimplePlugin):
             return meta_tag['content']
     
     async def _download_file(self, url, filename=None):
-        path, resp = await self.session.download(url, headers=self._headers, cookies=self._cookies, suffix=filename)
+        if url.startswith('data:'):
+            path = save_data_uri(url)
+            
+        else:
+            path, resp = await self.session.download(url, headers=self._headers, cookies=self._cookies, suffix=filename)
+        
         return path
     
     async def _content_to_post(self, post, content, remote_post=None, preview=False):
@@ -364,9 +370,14 @@ class Fantia(SimplePlugin):
                             self.session.add(file)
                             await self.session.flush()
                         
-                        # should use parse_url here (function from other plugins)
-                        orig_url = FILE_DOWNLOAD_URL.format(download_uri=fantiaImage.original_url)
-                        thumb_url = fantiaImage.url
+                        if fantiaImage.url.startswith('data:'):
+                            orig_url = fantiaImage.url
+                            thumb_url = fantiaImage.url
+                            
+                        else:
+                            # should use parse_url here (function from other plugins)
+                            orig_url = FILE_DOWNLOAD_URL.format(download_uri=fantiaImage.original_url)
+                            thumb_url = fantiaImage.url
                         
                         need_orig = not file.present and not preview
                         need_thumb = not file.thumb_present
