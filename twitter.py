@@ -17,11 +17,13 @@ from hoordu.models import *
 from hoordu.plugins import *
 from hoordu.forms import *
 
-TWEET_DETAIL_URL = 'https://twitter.com/i/api/graphql/Pn68XRZwyV9ClrAEmK8rrQ/TweetDetail'
-USER_BY_ID = 'https://twitter.com/i/api/graphql/8slyDObmnUzBOCu7kYZj_A/UserByRestId'
-USER_BY_SCREENNAME = 'https://twitter.com/i/api/graphql/qRednkZG-rn1P6b48NINmQ/UserByScreenName'
-TIMELINE_URL = 'https://twitter.com/i/api/graphql/2dNLofLWl-u8EQPURIAp9w/UserTweetsAndReplies'
-LIKES_URL = 'https://twitter.com/i/api/graphql/QPKcH_nml6UIOxHLjmNsuw/Likes'
+DOMAIN = 'tweetdeck.twitter.com'
+TWEET_DETAIL_URL = f'https://{DOMAIN}/i/api/graphql/Pn68XRZwyV9ClrAEmK8rrQ/TweetDetail'
+USER_BY_ID = f'https://{DOMAIN}/i/api/graphql/8slyDObmnUzBOCu7kYZj_A/UserByRestId'
+USER_BY_SCREENNAME = f'https://{DOMAIN}/i/api/graphql/qRednkZG-rn1P6b48NINmQ/UserByScreenName'
+TIMELINE_URL = f'https://{DOMAIN}/i/api/graphql/wxoVeDnl0mP7VLhe6mTOdg/UserTweetsAndReplies'
+MEDIATIMELINE_URL = f'https://{DOMAIN}/i/api/graphql/Az0-KW6F-FyYTc2OJmvUhg/UserMedia'
+LIKES_URL = f'https://{DOMAIN}/i/api/graphql/kgZtsNyE46T3JaEf2nF9vw/Likes'
 
 TWEET_FORMAT = 'https://twitter.com/{user}/status/{tweet_id}'
 TWEET_REGEXP = [
@@ -75,7 +77,6 @@ class TwitterClient:
         }
         
         self.http = aiohttp.ClientSession(cookies=cookies, headers=headers)
-        #self.http.headers.update(**headers)
     
     async def __aenter__(self) -> 'TwitterClient':
         await self.http.__aenter__()
@@ -182,15 +183,65 @@ class TwitterClient:
                         if 'tweet' in tweet: tweet = tweet.tweet
                         if tweet.rest_id == tweet_id:
                             return tweet
-        
     
     async def get_timeline(self, user_id, count=PAGE_LIMIT, cursor=None):
-        # all tweets, including replies
         variables = {
             'userId': user_id,
             'count': count,
             'includePromotedContent': True,
             'withCommunity': True,
+            'withVoice': True,
+            'withV2Timeline': True
+        }
+        features = {
+            'rweb_lists_timeline_redesign_enabled': True,
+            'responsive_web_graphql_exclude_directive_enabled': True,
+            'verified_phone_label_enabled': False,
+            'creator_subscriptions_tweet_preview_api_enabled': True,
+            'responsive_web_graphql_timeline_navigation_enabled': True,
+            'responsive_web_graphql_skip_user_profile_image_extensions_enabled': False,
+            'tweetypie_unmention_optimization_enabled': True,
+            'responsive_web_edit_tweet_api_enabled': True,
+            'graphql_is_translatable_rweb_tweet_is_translatable_enabled': True,
+            'view_counts_everywhere_api_enabled': True,
+            'longform_notetweets_consumption_enabled': True,
+            'responsive_web_twitter_article_tweet_consumption_enabled': False,
+            'tweet_awards_web_tipping_enabled': False,
+            'freedom_of_speech_not_reach_fetch_enabled': True,
+            'standardized_nudges_misinfo': True,
+            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': True,
+            'longform_notetweets_rich_text_read_enabled': True,
+            'longform_notetweets_inline_media_enabled': True,
+            'responsive_web_media_download_video_enabled': False,
+            'responsive_web_enhance_cards_enabled': False
+        }
+        fieldToggles = {
+            'withArticleRichContentState': False
+        }
+        
+        if cursor is not None:
+            variables['cursor'] = cursor
+        
+        params = {
+            'variables': json.dumps(variables),
+            'features': json.dumps(features),
+            'fieldToggles': json.dumps(fieldToggles),
+        }
+        
+        async with self._get(TIMELINE_URL, params=params) as resp:
+            text = await resp.text()
+            try:
+                return hoordu.Dynamic.from_json(text)
+            except:
+                raise ApiError(text)
+    
+    async def get_media_timeline(self, user_id, count=PAGE_LIMIT, cursor=None):
+        variables = {
+            'userId': user_id,
+            'count': count,
+            'includePromotedContent': False,
+            'withClientEventToken': False,
+            'withBirdwatchNotes': False,
             'withVoice': True,
             'withV2Timeline': True,
         }
@@ -206,13 +257,18 @@ class TwitterClient:
             'graphql_is_translatable_rweb_tweet_is_translatable_enabled': True,
             'view_counts_everywhere_api_enabled': True,
             'longform_notetweets_consumption_enabled': True,
+            'responsive_web_twitter_article_tweet_consumption_enabled': False,
             'tweet_awards_web_tipping_enabled': False,
             'freedom_of_speech_not_reach_fetch_enabled': True,
             'standardized_nudges_misinfo': True,
-            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': False,
+            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': True,
             'longform_notetweets_rich_text_read_enabled': True,
-            'longform_notetweets_inline_media_enabled': False,
+            'longform_notetweets_inline_media_enabled': True,
+            'responsive_web_media_download_video_enabled': False,
             'responsive_web_enhance_cards_enabled': False,
+        }
+        fieldToggles = {
+            'withArticleRichContentState': False,
         }
         
         if cursor is not None:
@@ -221,9 +277,62 @@ class TwitterClient:
         params = {
             'variables': json.dumps(variables),
             'features': json.dumps(features),
+            'fieldToggles': json.dumps(fieldToggles),
         }
         
-        async with self._get(TIMELINE_URL, params=params) as resp:
+        async with self._get(MEDIATIMELINE_URL, params=params) as resp:
+            text = await resp.text()
+            try:
+                return hoordu.Dynamic.from_json(text)
+            except:
+                raise ApiError(text)
+    
+    async def get_likes(self, user_id, count=PAGE_LIMIT, cursor=None):
+        variables = {
+            'userId': user_id,
+            'count': count,
+            'includePromotedContent': False,
+            'withClientEventToken': False,
+            'withBirdwatchNotes': False,
+            'withVoice': True,
+            'withV2Timeline': True,
+        }
+        features = {
+            'rweb_lists_timeline_redesign_enabled':True,
+            'responsive_web_graphql_exclude_directive_enabled':True,
+            'verified_phone_label_enabled':False,
+            'creator_subscriptions_tweet_preview_api_enabled':True,
+            'responsive_web_graphql_timeline_navigation_enabled':True,
+            'responsive_web_graphql_skip_user_profile_image_extensions_enabled':False,
+            'tweetypie_unmention_optimization_enabled':True,
+            'responsive_web_edit_tweet_api_enabled':True,
+            'graphql_is_translatable_rweb_tweet_is_translatable_enabled':True,
+            'view_counts_everywhere_api_enabled':True,
+            'longform_notetweets_consumption_enabled':True,
+            'responsive_web_twitter_article_tweet_consumption_enabled':False,
+            'tweet_awards_web_tipping_enabled':False,
+            'freedom_of_speech_not_reach_fetch_enabled':True,
+            'standardized_nudges_misinfo':True,
+            'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled':True,
+            'longform_notetweets_rich_text_read_enabled':True,
+            'longform_notetweets_inline_media_enabled':True,
+            'responsive_web_media_download_video_enabled':False,
+            'responsive_web_enhance_cards_enabled':False
+        }
+        fieldToggles = {
+            'withArticleRichContentState': False,
+        }
+        
+        if cursor is not None:
+            variables['cursor'] = cursor
+        
+        params = {
+            'variables': json.dumps(variables),
+            'features': json.dumps(features),
+            'fieldToggles': json.dumps(fieldToggles),
+        }
+        
+        async with self._get(LIKES_URL, params=params) as resp:
             return hoordu.Dynamic.from_json(await resp.text())
 
 
@@ -266,10 +375,15 @@ class TweetIterator(IteratorBase['Twitter']):
         super().reconfigure(direction=direction, num_posts=num_posts)
     
     def _validate_user(self, tweet):
-        tweet_user_id = tweet.core.user_results.result.rest_id
-        is_same_user = (tweet_user_id == self.options.user_id)
+        try:
+            tweet_user_id = tweet.core.user_results.result.rest_id
+            is_same_user = (tweet_user_id == self.options.user_id)
+        except AttributeError:
+            self.log.warning(tweet)
+            is_same_user = False
         
-        # if self.options.method == 'likes ??
+        if self.options.method == 'likes':
+            return True
         
         return is_same_user
     
@@ -279,39 +393,45 @@ class TweetIterator(IteratorBase['Twitter']):
         
         while True:
             self.log.info('getting next page')
-            body = await self.api.get_timeline(self.options.user_id, count=count, cursor=cursor)
+            if self.options.method == 'tweets':
+                body = await self.api.get_media_timeline(self.options.user_id, count=count, cursor=cursor)
+            elif self.options.method == 'retweets':
+                body = await self.api.get_timeline(self.options.user_id, count=count, cursor=cursor)
+            elif self.options.method == 'likes':
+                body = await self.api.get_likes(self.options.user_id, count=count, cursor=cursor)
             
             try:
                 instructions = body.data.user.result.timeline_v2.timeline.instructions
             except:
-                print(body)
+                self.log.warning(body)
                 raise
             
             for inst in instructions:
                 if inst.type == 'TimelinePinEntry':
                     entry = inst.entry
-                    sort_id = entry.sortIndex
                     if entry.content.entryType == 'TimelineTimelineItem':
-                        tweet = entry.content.itemContent.tweet_results.result
-                        if 'tweet' in tweet: tweet = tweet.tweet
-                        if self._validate_user(tweet):
-                            yield True, tweet
+                        tweet = entry.content.itemContent.tweet_results.get('result')
+                        if tweet is not None:
+                            if 'tweet' in tweet: tweet = tweet.tweet
+                            if self._validate_user(tweet):
+                                yield True, tweet.rest_id, tweet
                     
                 elif inst.type == 'TimelineAddEntries':
                     for entry in inst.entries:
                         entryType = entry.entryId.rsplit('-', 1)[0]
                         if entryType == 'tweet':
-                            tweet = entry.content.itemContent.tweet_results.result
-                            if 'tweet' in tweet: tweet = tweet.tweet
-                            if self._validate_user(tweet):
-                                yield False, tweet
+                            tweet = entry.content.itemContent.tweet_results.get('result')
+                            if tweet is not None:
+                                if 'tweet' in tweet: tweet = tweet.tweet
+                                if self._validate_user(tweet):
+                                    yield False, (entry.sortIndex if self.options.method == 'likes' else tweet.rest_id), tweet
                             
                         elif entryType == 'profile-conversation':
                             for item in entry.content['items']:
                                 tweet = content = item.item.itemContent.tweet_results.result
                                 if 'tweet' in tweet: tweet = tweet.tweet
                                 if self._validate_user(tweet):
-                                    yield False, tweet
+                                    yield False, tweet.rest_id, tweet
                             
                         elif entryType == 'cursor-bottom':
                             cursor = entry.content.value
@@ -364,19 +484,23 @@ class TweetIterator(IteratorBase['Twitter']):
             return has_media and not is_retweet
             
         elif self.options.method == 'likes':
-            raise NotImplementedError
+            return has_media
     
     async def generator(self):
         is_first_tweet = True
         
-        async for is_pinned, tweet in self._feed_iterator():
+        async for is_pinned, sort_index, tweet in self._feed_iterator():
+            if tweet.get('__typename') == 'TweetTombstone':
+                # sometimes deleted tweets show up
+                continue
+            
             if not is_pinned and is_first_tweet:
                 if self.state.head_id is None or self.direction == FetchDirection.newer:
-                    self.first_id = tweet.rest_id
+                    self.first_id = sort_index
                 
                 is_first_tweet = False
             
-            if not is_pinned and self.direction == FetchDirection.newer and int(tweet.rest_id) <= int(self.state.head_id):
+            if not is_pinned and self.direction == FetchDirection.newer and int(sort_index) <= int(self.state.head_id):
                 break
             
             if self._validate_method(tweet):
@@ -389,7 +513,7 @@ class TweetIterator(IteratorBase['Twitter']):
                 await self.session.commit()
             
             if not is_pinned and self.direction == FetchDirection.older:
-                self.state.tail_id = tweet.rest_id
+                self.state.tail_id = sort_index
         
         if self.first_id is not None:
             self.state.head_id = self.first_id
@@ -591,6 +715,9 @@ class Twitter(SimplePlugin):
         
         async def add_related_tweet(related):
             if 'tweet' in related: related = related.tweet
+            if related.get('__typename') == 'TweetTombstone':
+                return
+            
             related_id = related.rest_id
             related_user = related.core.user_results.result
             url = TWEET_FORMAT.format(user=related_user.legacy.screen_name, tweet_id=related_id)
