@@ -86,7 +86,8 @@ class UserIterator(IteratorBase['Nijie']):
                 if first_iteration and (self.state.head_id is None or self.direction == FetchDirection.newer):
                     self.first_id = post_id
                 
-                yield await self.plugin._to_remote_post(str(post_id), preview=self.subscription is None)
+                db_post = await self.plugin._to_remote_post(str(post_id), preview=self.subscription is None)
+                yield post_id, db_post
                 
                 if self.direction == FetchDirection.older:
                     self.state.tail_id = post_id
@@ -101,11 +102,11 @@ class UserIterator(IteratorBase['Nijie']):
             page_id += 1
     
     async def generator(self):
-        async for post in self._iterator():
+        async for sort_index, post in self._iterator():
             yield post
             
             if self.subscription is not None:
-                await self.subscription.add_post(post)
+                await self.subscription.add_post(post, sort_index)
             
             await self.session.commit()
         

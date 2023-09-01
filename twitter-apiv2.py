@@ -239,7 +239,7 @@ class TweetIterator(IteratorBase['Twitter']):
                 yield remote_post
                 
                 if self.subscription is not None:
-                    await self.subscription.add_post(remote_post)
+                    await self.subscription.add_post(remote_post, int(remote_post.original_id))
                 
                 await self.session.commit()
             

@@ -80,6 +80,7 @@ class IllustIterator(IteratorBase['Pixiv']):
             posts = posts[:self.num_posts]
         
         for post_id in posts:
+            sort_index = int(post_id)
             async with self.http.get(POST_GET_URL.format(post_id=post_id)) as resp:
                 resp.raise_for_status()
                 post = hoordu.Dynamic.from_json(await resp.text())
@@ -91,7 +92,7 @@ class IllustIterator(IteratorBase['Pixiv']):
                 self.state.head_id = post_id
             
             remote_post = await self.plugin._to_remote_post(post.body, preview=self.subscription is None)
-            yield remote_post
+            yield sort_index, remote_post
             
             if self.direction == FetchDirection.newer:
                 self.state.head_id = post_id
@@ -99,11 +100,11 @@ class IllustIterator(IteratorBase['Pixiv']):
                 self.state.tail_id = post_id
     
     async def generator(self):
-        async for post in self._iterator():
+        async for sort_index, post in self._iterator():
             yield post
             
             if self.subscription is not None:
-                await self.subscription.add_post(post)
+                await self.subscription.add_post(post, sort_index)
             
             await self.session.commit()
         
@@ -204,7 +205,7 @@ class BookmarkIterator(IteratorBase['Pixiv']):
                             raise APIError(post.message)
                         
                         remote_post = await self.plugin._to_remote_post(post.body, preview=self.subscription is None)
-                        yield remote_post
+                        yield bookmark_id, remote_post
                 
                 if self.direction == FetchDirection.older:
                     self.state.tail_id = bookmark.bookmarkData.id
@@ -219,11 +220,11 @@ class BookmarkIterator(IteratorBase['Pixiv']):
             first_iteration = False
     
     async def generator(self):
-        async for post in self._iterator():
+        async for sort_index, post in self._iterator():
             yield post
             
             if self.subscription is not None:
-                await self.subscription.add_post(post)
+                await self.subscription.add_post(post, sort_index)
             
             await self.session.commit()
         

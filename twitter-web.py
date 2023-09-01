@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import functools
 from collections import OrderedDict
 import dateutil.parser
+import json
 
 import aiohttp
 import contextlib
@@ -233,7 +234,7 @@ class TwitterClient:
             try:
                 return hoordu.Dynamic.from_json(text)
             except:
-                raise ApiError(text)
+                raise APIError(text)
     
     async def get_media_timeline(self, user_id, count=PAGE_LIMIT, cursor=None):
         variables = {
@@ -285,7 +286,7 @@ class TwitterClient:
             try:
                 return hoordu.Dynamic.from_json(text)
             except:
-                raise ApiError(text)
+                raise APIError(text)
     
     async def get_likes(self, user_id, count=PAGE_LIMIT, cursor=None):
         variables = {
@@ -508,7 +509,7 @@ class TweetIterator(IteratorBase['Twitter']):
                 yield remote_post
                 
                 if self.subscription is not None:
-                    await self.subscription.add_post(remote_post)
+                    await self.subscription.add_post(remote_post, int(sort_index))
                 
                 await self.session.commit()
             

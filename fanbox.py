@@ -123,13 +123,13 @@ class CreatorIterator(IteratorBase['Fanbox']):
                 self.first_id = posts[0].id
             
             for post in posts:
-                id = int(post.id)
-                if min_id is not None and id <= min_id:
+                sort_index = int(post.id)
+                if min_id is not None and sort_index <= min_id:
                     return
                 
-                yield post
+                yield sort_index, post
                 
-                max_id = id - 1
+                max_id = sort_index - 1
                 max_datetime = post.publishedDatetime
                 
                 if self.direction == FetchDirection.older:
@@ -146,7 +146,7 @@ class CreatorIterator(IteratorBase['Fanbox']):
             first_iteration = False
     
     async def generator(self):
-        async for post in self._post_iterator():
+        async for sort_index, post in self._post_iterator():
             if post.id in self.downloaded:
                 continue
             
@@ -160,7 +160,7 @@ class CreatorIterator(IteratorBase['Fanbox']):
             self.downloaded.add(post.id)
             
             if self.subscription is not None:
-                await self.subscription.add_post(remote_post)
+                await self.subscription.add_post(remote_post, sort_index)
             
             await self.session.commit()
         

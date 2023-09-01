@@ -59,12 +59,14 @@ class CreatorIterator(IteratorBase['Fantia']):
         head_id = post_id
         
         while post_id > self.state.head_id:
+            sort_index = int(post_id)
+            
             csrf = await self.plugin._get_csrf_token(post_id)
             async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
                 response.raise_for_status()
                 post = hoordu.Dynamic.from_json(await response.text()).post
             
-            yield post
+            yield sort_index, post
             
             next_post = post.links.previous
             if next_post is None:
@@ -93,7 +95,11 @@ class CreatorIterator(IteratorBase['Fantia']):
         else:
             post = None
             csrf = await self.plugin._get_csrf_token(post_id)
-            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
+            headers = {
+                'X-CSRF-Token': csrf,
+                'X-Requested-With': 'XMLHttpRequest',
+            }
+            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers=headers) as response:
                 was_deleted = (response.status == 404)
                 if not was_deleted:
                     response.raise_for_status()
@@ -107,8 +113,8 @@ class CreatorIterator(IteratorBase['Fantia']):
                 post_id = next_post.id
                 
             elif self.direction == FetchDirection.newer:
-                async for post in self._recover_head():
-                    yield post
+                async for sort_index, post in self._recover_head():
+                    yield sort_index, post
                 return
                 
             else:
@@ -118,11 +124,16 @@ class CreatorIterator(IteratorBase['Fantia']):
         it = range(self.num_posts) if self.num_posts is not None else iter(int, 1)
         for _ in it:
             csrf = await self.plugin._get_csrf_token(post_id)
-            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers={'X-CSRF-Token': csrf}) as response:
+            headers = {
+                'X-CSRF-Token': csrf,
+                'X-Requested-With': 'XMLHttpRequest',
+            }
+            async with self.http.get(POST_GET_URL.format(post_id=post_id), headers=headers) as response:
                 response.raise_for_status()
                 post = hoordu.Dynamic.from_json(await response.text()).post
             
-            yield post
+            sort_index = int(post_id)
+            yield sort_index, post
             
             if self.direction == FetchDirection.newer:
                 self.state.head_id = post_id
@@ -136,12 +147,12 @@ class CreatorIterator(IteratorBase['Fantia']):
             post_id = next_post.id
     
     async def generator(self):
-        async for post in self._post_iterator():
+        async for sort_index, post in self._post_iterator():
             remote_post = await self.plugin._to_remote_post(post, preview=self.subscription is None)
             yield remote_post
             
             if self.subscription is not None:
-                await self.subscription.add_post(remote_post)
+                await self.subscription.add_post(remote_post, sort_index)
             
             await self.session.commit()
         
@@ -529,7 +540,11 @@ class Fantia(SimplePlugin):
             id = remote_post.original_id.split('-')[0]
         
         csrf = await self._get_csrf_token(id)
-        async with self.http.get(POST_GET_URL.format(post_id=id), headers={'X-CSRF-Token': csrf}) as response:
+        headers = {
+            'X-CSRF-Token': csrf,
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        async with self.http.get(POST_GET_URL.format(post_id=id), headers=headers) as response:
             response.raise_for_status()
             post = hoordu.Dynamic.from_json(await response.text()).post
         

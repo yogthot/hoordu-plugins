@@ -127,12 +127,14 @@ class CreatorIterator(IteratorBase['Patreon']):
                 self.first_timestamp = page.data[0].attributes.published_at
             
             for post in page.data:
+                sort_index = int(post.id)
+                
                 published_at = dateutil.parser.parse(post.attributes.published_at)
                 if self.head_timestamp is not None and published_at < self.head_timestamp:
                     return
                 
                 if post.attributes.current_user_can_view:
-                    yield post, includes
+                    yield sort_index, post, includes
             
             cursors = page.meta.pagination.get('cursors')
             if cursors is None:
@@ -143,7 +145,7 @@ class CreatorIterator(IteratorBase['Patreon']):
                 return
     
     async def generator(self):
-        async for post, included in self._post_iterator():
+        async for sort_index, post, included in self._post_iterator():
             if post.id in self.downloaded:
                 continue
             
@@ -152,7 +154,7 @@ class CreatorIterator(IteratorBase['Patreon']):
             self.downloaded.add(post.id)
             
             if self.subscription is not None:
-                await self.subscription.add_post(remote_post)
+                await self.subscription.add_post(remote_post, sort_index)
             
             await self.session.commit()
         
